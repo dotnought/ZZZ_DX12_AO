@@ -16,8 +16,8 @@ Vertex SceneVertex(uint id : SV_VertexID)
     return result;
 }
 
-float4 SceneColor(float2 uv : TEXCOORD0) : SV_Target0
+float4 SceneColor(Vertex input) : SV_Target0
 {
-    const float depth = NativeDepth.SampleLevel(NativeSampler, uv, 0);
+    const float depth = NativeDepth.SampleLevel(NativeSampler, input.uv, 0);
     return float4(depth, 0.5, 0.75, 1.0);
 }

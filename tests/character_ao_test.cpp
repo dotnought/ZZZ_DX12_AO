@@ -21,12 +21,21 @@ constexpr D3D12_RESOURCE_DESC color_desc{
     {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
 };
 
+bool Check(HRESULT result, const char *operation)
+{
+    if (SUCCEEDED(result))
+        return true;
+    std::cerr << operation << " failed with HRESULT 0x" << std::hex << static_cast<uint32_t>(result) << '\n';
+    return false;
+}
+
 ComPtr<ID3D12Resource> Allocate(ID3D12Device *device, D3D12_HEAP_TYPE type,
                                const D3D12_RESOURCE_DESC &desc, D3D12_RESOURCE_STATES state)
 {
     const D3D12_HEAP_PROPERTIES heap{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
     ComPtr<ID3D12Resource> result;
-    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&result));
+    Check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                         IID_PPV_ARGS(&result)), "CreateCommittedResource");
     return result;
 }
 
@@ -35,7 +44,7 @@ ComPtr<ID3D12DescriptorHeap> MakeHeap(ID3D12Device *device, D3D12_DESCRIPTOR_HEA
 {
     const D3D12_DESCRIPTOR_HEAP_DESC desc{type, count, flags, 0};
     ComPtr<ID3D12DescriptorHeap> result;
-    device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&result));
+    Check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&result)), "CreateDescriptorHeap");
     return result;
 }
 
@@ -84,13 +93,17 @@ ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignatu
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.DepthClipEnable = TRUE;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.DepthStencilState.FrontFace = desc.DepthStencilState.BackFace = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS
+    };
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = color_format;
     desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
-    device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    Check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)),
+          composite ? "Create composite pipeline" : "Create native pipeline");
     return pso;
 }
 
@@ -111,8 +124,10 @@ int main()
 
     auto native_root = OriginalRoot(device.Get());
     auto ao = zzz_ao::CharacterAo::Create(device.Get());
-    if (!native_root || !ao.Root())
+    if (!native_root || !ao.Root()) {
+        std::cerr << "Could not create the test root signatures.\n";
         return 1;
+    }
     auto native = MakePipeline(device.Get(), native_root.Get(), false);
     ao.Attach(MakePipeline(device.Get(), ao.Root(), true).Detach());
     if (!native || !ao)
@@ -225,7 +240,7 @@ int main()
         list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
         layout.Offset += stride;
     }
-    if (FAILED(list->Close()))
+    if (!Check(list->Close(), "Close command list"))
         return 1;
     ID3D12CommandList *lists[]{list.Get()};
     queue->ExecuteCommandLists(1, lists);
