@@ -40,7 +40,7 @@ add_custom_command(OUTPUT "${native_ao_header}" "${native_ao_dxil}"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/native_detail_ao.hlsl"
     DEPENDS shaders/native_detail_ao.hlsl
     VERBATIM)
-add_library(zzz_ao_capture MODULE src/capture.cpp "${native_ao_header}")
+add_library(zzz_ao_capture MODULE src/capture.cpp src/depth_capture.cpp "${native_ao_header}")
 target_include_directories(zzz_ao_capture PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}" "${IMGUI_INCLUDE_DIR}")
 target_compile_definitions(zzz_ao_capture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -48,6 +48,17 @@ target_link_libraries(zzz_ao_capture PRIVATE user32)
 set_target_properties(zzz_ao_capture PROPERTIES
     PREFIX "" SUFFIX ".addon64"
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+option(ZZZ_AO_TEST_DEPTH_CAPTURE "Validate depth snapshot readback with D3D12 WARP" OFF)
+if(ZZZ_AO_TEST_DEPTH_CAPTURE)
+    enable_testing()
+    add_executable(zzz_ao_depth_capture_test tests/depth_capture_test.cpp src/depth_capture.cpp)
+    target_include_directories(zzz_ao_depth_capture_test PRIVATE src)
+    target_compile_definitions(zzz_ao_depth_capture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(zzz_ao_depth_capture_test PRIVATE d3d12 dxgi)
+    add_test(NAME depth_capture COMMAND zzz_ao_depth_capture_test)
+    set_tests_properties(depth_capture PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 option(ZZZ_AO_BUILD_COMPUTE "Build the XeGTAO backend and its DXIL shaders" ON)
 if(NOT ZZZ_AO_BUILD_COMPUTE)

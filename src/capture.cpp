@@ -3,6 +3,7 @@
 #include <reshade.hpp>
 
 #include "native_detail_ao.hpp"
+#include "depth_capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,7 @@ using namespace reshade;
 namespace a = reshade::api;
 
 constexpr unsigned interval_count = 4;
+constexpr unsigned max_depth_intervals = interval_count * 2;
 constexpr size_t max_list_rows = 24000;
 constexpr size_t max_trace_rows = 120000;
 constexpr size_t max_live_rows = 120000;
@@ -56,6 +58,7 @@ struct Pipeline {
 constexpr uint64_t half_mask_shader = 10793278501038871532ull;
 constexpr uint64_t blur_mask_shader = 18023612121467718113ull;
 constexpr uint64_t upsample_mask_shader = 9317972913748041275ull;
+constexpr uint64_t prescale_scene_shader = 7607800794214941815ull;
 struct NativeShader {
     uint64_t fingerprint;
     const char *name;
@@ -67,6 +70,11 @@ constexpr auto native_shaders = std::to_array<NativeShader>({
     {upsample_mask_shader, "ps_upsample_mask"},
     {16383356142044416029ull, "ps_lighting_candidate"},
     {2471263705428555365ull, "cs_half_resolution_mask"},
+    {15181696564642202686ull, "ps_after_world_lighting_1"},
+    {11889072915614133341ull, "ps_after_world_lighting_2"},
+    {12916642976149190619ull, "ps_late_scene_geometry"},
+    {16133994147759704127ull, "ps_late_scene_overlay"},
+    {prescale_scene_shader, "ps_prescale_scene_color"},
 });
 constexpr size_t max_native_shader_bytes = 256 * 1024;
 using NativeShaderSet = std::bitset<native_shaders.size()>;
@@ -83,6 +91,14 @@ struct List {
     size_t dropped = 0;
     std::vector<Row> rows;
     NativeShaderSet native_shaders_seen;
+    a::resource depth_target{};
+    uint32_t color_target_count = 0;
+    bool explicit_render_pass = false;
+    a::resource depth_copy_candidate{};
+    a::resource live_depth{};
+    a::resource before_ao_depth{};
+    a::resource_usage live_depth_state = a::resource_usage::undefined;
+    bool prescale_scene_seen = false;
 };
 
 constexpr uint32_t probe_width = 1720;
@@ -141,14 +157,18 @@ struct Capture {
     std::unordered_set<uint64_t> emitted_textures;
     std::vector<std::string> rows;
     NativeShaderSet native_shaders_seen;
+    std::shared_ptr<zzz_ao::DepthCapture> depth;
+    bool depth_copy_point_seen = false;
 };
 
 std::atomic_bool capturing{false};
 std::atomic_bool probing{false};
+std::atomic_bool depth_pending{false};
 MaskProbe mask_probe;
 Controls controls;
 std::mutex mutex;
 Capture capture;
+std::shared_ptr<zzz_ao::DepthCapture> pending_depth;
 std::unordered_map<uint64_t, Texture> textures;
 std::unordered_map<uint64_t, Pipeline> pipelines;
 std::array<std::vector<uint8_t>, native_shaders.size()> native_shader_code;
@@ -560,14 +580,17 @@ void bind_pipeline(a::command_list *cmd, a::pipeline_stage stages, a::pipeline p
 }
 
 void targets(a::command_list *cmd, const char *kind, uint32_t count,
-             const a::resource_view *colors, a::resource_view depth)
+             const a::resource_view *colors, a::resource_view depth, bool explicit_pass = false)
 {
     on_list(cmd, [&](List &list) {
         auto *device = cmd->get_device();
+        list.depth_target = depth.handle ? device->get_resource_from_view(depth) : a::resource{};
+        list.color_target_count = count;
+        list.explicit_render_pass = explicit_pass;
         const auto view_id = [&](a::resource_view view) {
             return view.handle != 0 ? emit_resource(device, device->get_resource_from_view(view)) : 0;
         };
-        std::string row = line(kind, view_id(depth), count);
+        std::string row = line(kind, emit_resource(device, list.depth_target), count);
         for (uint32_t i = 0; i < count; ++i)
             row += '\t' + std::to_string(view_id(colors[i]));
         append(list, std::move(row), true);
@@ -591,7 +614,7 @@ void begin_pass(a::command_list *cmd, uint32_t count, const a::render_pass_rende
     const uint32_t limit = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
     for (uint32_t i = 0; i < limit; ++i)
         views[i] = colors[i].view;
-    targets(cmd, "begin_pass", limit, views, depth != nullptr ? depth->view : a::resource_view{});
+    targets(cmd, "begin_pass", limit, views, depth != nullptr ? depth->view : a::resource_view{}, true);
     on_mask_list(cmd, [](MaskList &list) {
         list.render_pass_open = true;
         list.stage = MaskStage::waiting;
@@ -600,7 +623,12 @@ void begin_pass(a::command_list *cmd, uint32_t count, const a::render_pass_rende
 
 void end_pass(a::command_list *cmd)
 {
-    on_list(cmd, [](List &list) { append(list, "end_pass"); });
+    on_list(cmd, [](List &list) {
+        list.explicit_render_pass = false;
+        list.depth_target = {};
+        list.color_target_count = 0;
+        append(list, "end_pass");
+    });
     on_mask_list(cmd, [](MaskList &list) {
         list.render_pass_open = false;
         list.target = {};
@@ -626,6 +654,14 @@ void barrier(a::command_list *cmd, uint32_t count, const a::resource *res,
 {
     on_list(cmd, [&](List &list) {
         for (uint32_t i = 0; i < count; ++i) {
+            if (res[i] == list.depth_copy_candidate)
+                list.depth_copy_candidate = {};
+            if (res[i].handle && res[i] == list.depth_target && list.color_target_count == 4 &&
+                before[i] == a::resource_usage::depth_stencil_write &&
+                after[i] == a::resource_usage::copy_source)
+                list.depth_copy_candidate = res[i];
+            if (res[i].handle && res[i] == list.live_depth)
+                list.live_depth_state = after[i];
             const auto id = emit_resource(cmd->get_device(), res[i]);
             if (id)
                 append(list, line("barrier", id, static_cast<uint32_t>(before[i]), static_cast<uint32_t>(after[i])));
@@ -646,6 +682,49 @@ bool clear_depth(a::command_list *cmd, a::resource_view view, const float *depth
     return false;
 }
 
+bool full_scene_depth(a::device *device, a::resource resource)
+{
+    if (!resource.handle)
+        return false;
+    const auto &desc = texture(device, resource).desc;
+    return screen_texture(desc) && desc.texture.format == a::format::r32_g8_typeless &&
+           desc.texture.width == probe_width && desc.texture.height == probe_height &&
+           desc.texture.samples == 1;
+}
+
+void record_character_depth(a::command_list *cmd, List &list, a::resource source, a::resource dest)
+{
+    if (capture.depth || pending_depth || list.explicit_render_pass)
+        return;
+
+    if (source.handle && source == list.depth_copy_candidate) {
+        list.depth_copy_candidate = {};
+        if (full_scene_depth(cmd->get_device(), source) && full_scene_depth(cmd->get_device(), dest)) {
+            list.live_depth = source;
+            list.before_ao_depth = dest;
+            list.live_depth_state = a::resource_usage::copy_source;
+            list.prescale_scene_seen = false;
+        }
+        return;
+    }
+
+    // The game is about to read its earlier depth copy again for upscaling.
+    // Its live depth is now unbound, with the DEPTH_WRITE state observed.
+    if (!list.prescale_scene_seen || list.depth_target.handle || !source.handle ||
+        source != list.before_ao_depth || list.live_depth_state != a::resource_usage::depth_stencil_write)
+        return;
+    capture.depth_copy_point_seen = true;
+    auto job = zzz_ao::DepthCapture::Record(
+        reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native()),
+        reinterpret_cast<ID3D12Resource *>(source.handle),
+        reinterpret_cast<ID3D12Resource *>(list.live_depth.handle));
+    if (job) {
+        capture.depth = job;
+        pending_depth = std::move(job);
+        depth_pending.store(true, std::memory_order_relaxed);
+    }
+}
+
 bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
 {
     on_list(cmd, [&](List &list) {
@@ -653,6 +732,7 @@ bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
         const auto to = emit_resource(cmd->get_device(), dest);
         if (from && to)
             append(list, line("copy", from, to));
+        record_character_depth(cmd, list, source, dest);
     });
     return false;
 }
@@ -723,6 +803,8 @@ MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t 
         const auto it = pipelines.find(list.pipeline);
         const Pipeline pipeline = it != pipelines.end() ? it->second : Pipeline{};
         const uint64_t shader = pipeline.pixel_shader;
+        if (shader == prescale_scene_shader && list.before_ao_depth.handle)
+            list.prescale_scene_seen = true;
         mark_native_shader(list, shader, list.graphics_layout ? list.graphics_layout : pipeline.layout);
         append(list, line("draw", list.pipeline, shader, list.graphics_layout), true);
     });
@@ -820,9 +902,17 @@ bool indirect(a::command_list *cmd, a::indirect_command type, a::resource, uint6
 
 void forget_list(a::command_list *cmd)
 {
-    if (!capturing.load(std::memory_order_relaxed) && !probing.load(std::memory_order_relaxed))
+    if (!capturing.load(std::memory_order_relaxed) && !probing.load(std::memory_order_relaxed) &&
+        !depth_pending.load(std::memory_order_relaxed))
         return;
     const std::lock_guard lock(mutex);
+    if (pending_depth && pending_depth->IsList(reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native()))) {
+        pending_depth->RetireList();
+        if (!pending_depth->HasSubmission() || pending_depth->Ready()) {
+            pending_depth.reset();
+            depth_pending.store(false, std::memory_order_relaxed);
+        }
+    }
     const auto it = capture.lists.find(cmd);
     if (it != capture.lists.end()) {
         capture.live_rows -= it->second.rows.size();
@@ -876,6 +966,10 @@ void bundle(a::command_list *parent, a::command_list *child)
         append(list, "end_bundle");
         // A bundle may set the pipeline and root state inherited by the parent.
         list.pipeline = list.graphics_layout = list.compute_layout = 0;
+        list.depth_target = {};
+        list.color_target_count = 0;
+        list.depth_copy_candidate = {};
+        list.live_depth_state = a::resource_usage::undefined;
     });
 }
 
@@ -903,9 +997,11 @@ void submit(a::command_queue *queue, a::command_list *cmd)
     if (message)
         log::message(log::level::info, message);
 
-    if (!capturing.load(std::memory_order_relaxed))
+    if (!capturing.load(std::memory_order_relaxed) && !depth_pending.load(std::memory_order_relaxed))
         return;
     const std::lock_guard lock(mutex);
+    if (pending_depth && pending_depth->IsList(reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native())))
+        pending_depth->Submitted(reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()));
     if (capture.device == nullptr || queue->get_device() != capture.device)
         return;
     const auto it = capture.lists.find(cmd);
@@ -956,6 +1052,15 @@ void save(Capture &finished)
     for (const auto &row : finished.rows)
         out << row << '\n';
     save_native_shaders(out, finished.native_shaders_seen);
+    std::string depth_rows;
+    if (finished.depth) {
+        const std::lock_guard lock(mutex);
+        depth_rows = finished.depth->ReadRows();
+    } else {
+        depth_rows = finished.depth_copy_point_seen ? "character_depth_status\tcopy_setup_failed\n"
+                                                   : "character_depth_status\tpass_not_matched\n";
+    }
+    out << depth_rows;
     out << line("summary", finished.presents, finished.unobserved_lists, finished.dropped) << '\n';
     out.close();
     if (out)
@@ -1010,6 +1115,17 @@ void destroy_settings_runtime(a::effect_runtime *runtime)
     }
 }
 
+void poll_depth_readback()
+{
+    if (!pending_depth)
+        return;
+    pending_depth->FinishPresent();
+    if (pending_depth->IsRetired() && pending_depth->Ready()) {
+        pending_depth.reset();
+        depth_pending.store(false, std::memory_order_relaxed);
+    }
+}
+
 void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, const a::rect *,
              uint32_t, const a::rect *)
 {
@@ -1023,6 +1139,7 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
     bool probe_missed = false;
     {
         const std::lock_guard lock(mutex);
+        poll_depth_readback();
         const bool selected = focused && controls.runtime && controls.runtime->get_hwnd() == window &&
                               controls.runtime->get_device() == device;
         auto mode = MaskOverride::off;
@@ -1046,7 +1163,9 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
         if (capture.swapchain == swapchain) {
             ++capture.presents;
             append_trace(line("present", capture.presents, emit_resource(device, swapchain->get_current_back_buffer())));
-            if (capture.presents == interval_count) {
+            const bool depth_in_flight = capture.depth && capture.depth->HasSubmission() &&
+                                         !capture.depth->Ready() && capture.presents < max_depth_intervals;
+            if (capture.presents >= interval_count && !depth_in_flight) {
                 append_trace(line("descriptor_limit_reached", descriptor_limit_reached));
                 capturing.store(false, std::memory_order_relaxed);
                 finished = std::exchange(capture, Capture{});
@@ -1067,6 +1186,14 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
         log::message(log::level::info, "ZZZ AO mask probe found no matching submitted draw.");
     if (finished.id != 0)
         save(finished);
+}
+
+void finish_present(a::command_queue *, a::swapchain *)
+{
+    if (!depth_pending.load(std::memory_order_relaxed))
+        return;
+    const std::lock_guard lock(mutex);
+    poll_depth_readback();
 }
 
 void destroy_swapchain(a::swapchain *swapchain, bool)
@@ -1146,6 +1273,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
         observe<addon_event::execute_secondary_command_list, bundle>();
         observe<addon_event::execute_command_list, submit>();
         observe<addon_event::present, present>();
+        observe<addon_event::finish_present, finish_present>();
         observe<addon_event::destroy_swapchain, destroy_swapchain>();
         observe<addon_event::destroy_effect_runtime, destroy_settings_runtime>();
         observe<addon_event::reshade_open_overlay, overlay_state_changed>();

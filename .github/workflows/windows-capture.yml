@@ -7,6 +7,9 @@ on:
       - .github/workflows/windows-capture.yml
       - CMakeLists.txt
       - src/capture.cpp
+      - src/depth_capture.cpp
+      - src/depth_capture.hpp
+      - tests/depth_capture_test.cpp
       - shaders/native_detail_ao.hlsl
       - README.md
       - third_party/reshade/LICENSE.md
@@ -28,9 +31,11 @@ jobs:
             Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
             Select-Object -First 1
           if (!$dxc) { throw 'DirectX Shader Compiler was not found in the Windows SDK.' }
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF "-DDXC_EXECUTABLE=$($dxc.FullName)"
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF -DZZZ_AO_TEST_DEPTH_CAPTURE=ON "-DDXC_EXECUTABLE=$($dxc.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target zzz_ao_capture
+          cmake --build build --config Release --target zzz_ao_capture zzz_ao_depth_capture_test
+      - name: Test D3D12 depth readback
+        run: ctest --test-dir build -C Release --output-on-failure
       - name: Package focused build
         run: |
           New-Item -Type Directory -Path package
