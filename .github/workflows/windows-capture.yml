@@ -7,6 +7,7 @@ on:
       - .github/workflows/windows-capture.yml
       - CMakeLists.txt
       - src/capture.cpp
+      - shaders/native_detail_ao.hlsl
       - README.md
       - third_party/reshade/LICENSE.md
       - third_party/imgui/LICENSE.txt
@@ -22,7 +23,12 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Build capture add-on
         run: |
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
+          $dxc = Get-ChildItem "$sdk/*/x64/dxc.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+            Select-Object -First 1
+          if (!$dxc) { throw 'DirectX Shader Compiler was not found in the Windows SDK.' }
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF "-DDXC_EXECUTABLE=$($dxc.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config Release --target zzz_ao_capture
       - name: Package focused build

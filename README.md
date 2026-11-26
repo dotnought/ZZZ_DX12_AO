@@ -1,10 +1,10 @@
 # ZZZ DX12 AO
 
-This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. The ReShade add-on panel can record a read-only trace. The add-on can override the native visibility mask for diagnosis in ZZZ 3.2. The XeGTAO backend can record a replacement into that game's R8 mask format. Live replacement needs verified native inputs and a command-list integration that preserves the game's bindings.
+This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. The ReShade add-on panel can record a read-only trace. The add-on can replace the native visibility resolve for ZZZ 3.2 with an opt-in full-resolution detail AO shader. It also supports diagnostic mask overrides. The separate XeGTAO backend can record a replacement into the game's R8 mask format.
 
 ## Build on Windows 11
 
-Install Visual Studio Community 2026 with **Desktop development with C++**, the x64 MSVC toolchain, Windows SDK and CMake 4.2 or newer for the VS 2026 generator. For the compute build, use an SDK with the x64 DirectX Shader Compiler (`dxc.exe`). Run these commands in the **x64 Native Tools Command Prompt for VS** from the repository root.
+Install Visual Studio Community 2026 with **Desktop development with C++**, the x64 MSVC toolchain, Windows SDK and CMake 4.2 or newer for the VS 2026 generator. Use a Windows SDK with the x64 DirectX Shader Compiler (`dxc.exe`). The add-on embeds its compiled native pixel shader. Run these commands in the **x64 Native Tools Command Prompt for VS** from the repository root.
 
 ```bat
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64
@@ -19,7 +19,15 @@ CMake downloads and verifies the pinned ReShade 6.7.3 and Dear ImGui 1.92.5 arch
 | Native C++ backend | `build/Release/zzz_ao_dx12.lib` |
 | Compute shader bytecode | `build/shaders/*.dxil` |
 
-For a capture-only build, configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` and build `--target zzz_ao_capture`. This requires no DXC.
+Configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` to build the add-on without the separate XeGTAO backend.
+
+## Native detail AO
+
+At 3440×1440 with DLSS Performance, expand **Add-ons → ZZZ DX12 AO Capture** and toggle **Native detail AO**. Check hairlines, collars, layered clothing and curb edges in the same scene. Turn the toggle off to restore the stock shader. The ReShade log reports `ZZZ AO submitted native detail AO` when a matching draw is submitted.
+
+The captured DXIL confirms the original full-resolution resolve reads scene device depth at `t0`, half-resolution eye depth at `t1`, a material flag in `t2.a` and filtered visibility at `t3`. Its `b0` constants supply the eye-depth conversion. The original resolve returns full visibility when the material flag exceeds 0.5. The detail shader keeps the native half-resolution mask as its base and calculates short-range occlusion from the full-resolution depth, including valid geometry behind the original exclusion. It rejects large depth jumps and projects the local depth slope out of the estimate.
+
+The add-on creates the variant from the original PSO with the same root signature and uses it for the matched R8 resolve draw. It restores the original PSO immediately afterward. The toggle is off at startup. The 3.2 shader fingerprint, ordered mask draws, root layout and 1720×720 render extent must match. Character coverage and GPU cost require in-game validation. The replacement uses the depth already bound at this pass, so geometry drawn later or lit outside the mask's consumer can be unaffected.
 
 ## ZZZ 3.2 mask test
 
@@ -55,7 +63,7 @@ Look for a recurring internal-size depth attachment and scene-color producer. Fo
 
 The backend records a depth mip prefilter, one of four XeGTAO horizon passes, and edge-aware spatial denoising to an R8 visibility texture. Enable, intensity, view-space radius, falloff, sample quality, denoising and distance fade are independent. The backend accepts an active internal-resolution rectangle, native device depth conversion, jitter-aware view rays, and optional signed view-space normals. When normals are absent it derives them from depth. A temporal index can advance on each real render frame once a temporal consumer has been verified.
 
-The host must supply an SRV-compatible depth view and confirmed projection, choose a real-frame recording point on the render queue, and manage input states, lifetimes and fence slots. The backend uses dedicated DIRECT command lists on one render queue and tracks transitions for its own textures. The queue serializes shared scratch textures, while each in-flight slot retains its output, descriptors and timestamps. It emits two GPU timestamps and resolves them to readback storage without a CPU wait. `ResidentTextureBytes()` reports committed allocation sizes for its default-heap textures, excluding descriptors, queries and readback. Recreate the backend when the padded render extent changes, after the old work retires. `RecordToNativeMask` copies the active XeGTAO output into the existing single-sample R8 mask target and returns it to render-target state. Timing for that method includes the mask write. The add-on's live recording path still needs to identify the depth and projection bindings and preserve the game's state across the compute dispatch. The backend contract is in [src/xegtao_dx12.hpp](src/xegtao_dx12.hpp).
+The host must supply an SRV-compatible depth view and confirmed projection, choose a real-frame recording point on the render queue, and manage input states, lifetimes and fence slots. The backend uses dedicated DIRECT command lists on one render queue and tracks transitions for its own textures. The queue serializes shared scratch textures, while each in-flight slot retains its output, descriptors and timestamps. It emits two GPU timestamps and resolves them to readback storage without a CPU wait. `ResidentTextureBytes()` reports committed allocation sizes for its default-heap textures, excluding descriptors, queries and readback. Recreate the backend when the padded render extent changes, after the old work retires. `RecordToNativeMask` copies the active XeGTAO output into the existing single-sample R8 mask target and returns it to render-target state. Timing for that method includes the mask write. A live XeGTAO swap still needs confirmed projection inputs and command-list state management for the compute dispatch. The native detail test above uses the existing pixel-shader bindings. The backend contract is in [src/xegtao_dx12.hpp](src/xegtao_dx12.hpp).
 
 A confirmed native ambient/indirect lighting consumer is the preferred AO composition point. If that path is inaccessible, validate an internal-resolution scene-color composition point before DLSS Super Resolution and HUD rendering. NVIDIA documents the separate scaling input, depth, motion vectors and HUD-less inputs, so the observer needs to establish how ZZZ uses them. HoYoverse documents the graphics settings without publishing the underlying resource bindings. [DLSS Super Resolution integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS.md) · [DLSS Frame Generation integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md) · [ZZZ PC visual experience FAQ](https://zenless.hoyoverse.com/en-us/news/165408?catchSpider=1&lang=en-us&page=news)
 

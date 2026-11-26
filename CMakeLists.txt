@@ -30,7 +30,18 @@ if(NOT IMGUI_INCLUDE_DIR)
     set(IMGUI_INCLUDE_DIR "${imgui_SOURCE_DIR}")
 endif()
 
-add_library(zzz_ao_capture MODULE src/capture.cpp)
+find_program(DXC_EXECUTABLE NAMES dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+set(native_ao_header "${CMAKE_CURRENT_BINARY_DIR}/generated/native_detail_ao.hpp")
+set(native_ao_dxil "${CMAKE_CURRENT_BINARY_DIR}/generated/native_detail_ao.dxil")
+add_custom_command(OUTPUT "${native_ao_header}" "${native_ao_dxil}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E NativeDetailAo -O3 -Ges -WX
+        -Fo "${native_ao_dxil}" -Fh "${native_ao_header}" -Vn native_detail_ao_bytecode
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/native_detail_ao.hlsl"
+    DEPENDS shaders/native_detail_ao.hlsl
+    VERBATIM)
+add_library(zzz_ao_capture MODULE src/capture.cpp "${native_ao_header}")
+target_include_directories(zzz_ao_capture PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}" "${IMGUI_INCLUDE_DIR}")
 target_compile_definitions(zzz_ao_capture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(zzz_ao_capture PRIVATE user32)
@@ -43,7 +54,6 @@ if(NOT ZZZ_AO_BUILD_COMPUTE)
     return()
 endif()
 
-find_program(DXC_EXECUTABLE NAMES dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
 set(shader_outputs)
 foreach(entry IN ITEMS Prefilter HorizonLow HorizonMedium HorizonHigh HorizonUltra Denoise DenoiseFinal)
     set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${entry}.dxil")

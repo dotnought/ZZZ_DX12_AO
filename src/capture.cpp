@@ -2,6 +2,8 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
+#include "native_detail_ao.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -46,6 +48,7 @@ struct Pipeline {
     uint64_t pixel_shader = 0;
     uint64_t compute_shader = 0;
     uint64_t layout = 0;
+    a::pipeline detail_ao{};
 };
 
 // These fingerprints were present in the ZZZ 3.2 traces. Keep the cached
@@ -85,11 +88,13 @@ struct List {
 constexpr uint32_t probe_width = 1720;
 constexpr uint32_t probe_height = 720;
 
-enum class MaskOverride : uint8_t { off, white, black };
+enum class MaskOverride : uint8_t { off, white, black, detail };
 enum class MaskStage : uint8_t { waiting, half, blurred };
 
 struct MaskList {
     uint64_t pixel_shader = 0;
+    uint64_t graphics_layout = 0;
+    a::pipeline pipeline{};
     a::resource_view target{};
     a::resource target_resource{};
     a::resource half_resource{};
@@ -109,6 +114,7 @@ struct MaskProbe {
 
 struct Controls {
     a::effect_runtime *runtime = nullptr;
+    bool detail_ao = false;
     bool mask_enabled = false;
     bool black_mask = false;
     bool capture_requested = false;
@@ -295,6 +301,8 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
     info.layout = layout.handle;
     const a::shader_desc *pixel_shader = nullptr;
     const a::shader_desc *compute_shader = nullptr;
+    uint32_t pixel_index = 0;
+    bool mask_format = false;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &item = objects[i];
         if (item.count != 1 || item.data == nullptr)
@@ -302,24 +310,54 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
         if (item.type == a::pipeline_subobject_type::pixel_shader) {
             pixel_shader = static_cast<const a::shader_desc *>(item.data);
             info.pixel_shader = fingerprint(*pixel_shader);
+            pixel_index = i;
         }
         if (item.type == a::pipeline_subobject_type::compute_shader) {
             compute_shader = static_cast<const a::shader_desc *>(item.data);
             info.compute_shader = fingerprint(*compute_shader);
         }
+        if (item.type == a::pipeline_subobject_type::render_target_formats)
+            mask_format = *static_cast<const a::format *>(item.data) == a::format::r8_unorm;
     }
-    const std::lock_guard lock(mutex);
-    pipelines.insert_or_assign(pipeline.handle, info);
-    cache_native_shader(info.pixel_shader, pixel_shader);
-    cache_native_shader(info.compute_shader, compute_shader);
+
+    if (info.pixel_shader == upsample_mask_shader && layout.handle && mask_format) {
+        // Reuse the native root signature, vertex shader and fixed-function
+        // state. The replacement reads the same descriptor slots.
+        std::vector<a::pipeline_subobject> replacement(objects, objects + count);
+        a::shader_desc detail = *pixel_shader;
+        detail.code = native_detail_ao_bytecode;
+        detail.code_size = sizeof(native_detail_ao_bytecode);
+        replacement[pixel_index].data = &detail;
+        if (!device->create_pipeline(layout, count, replacement.data(), &info.detail_ao))
+            log::message(log::level::warning, "ZZZ AO could not create the native detail AO pipeline.");
+    }
+
+    try {
+        const std::lock_guard lock(mutex);
+        cache_native_shader(info.pixel_shader, pixel_shader);
+        cache_native_shader(info.compute_shader, compute_shader);
+        pipelines.insert_or_assign(pipeline.handle, info);
+    } catch (...) {
+        if (info.detail_ao.handle)
+            device->destroy_pipeline(info.detail_ao);
+        throw;
+    }
 }
 
 void destroy_pipeline(a::device *device, a::pipeline pipeline)
 {
     if (!dx12(device))
         return;
-    const std::lock_guard lock(mutex);
-    pipelines.erase(pipeline.handle);
+    a::pipeline detail{};
+    {
+        const std::lock_guard lock(mutex);
+        if (const auto it = pipelines.find(pipeline.handle); it != pipelines.end()) {
+            detail = it->second.detail_ao;
+            pipelines.erase(it);
+        }
+    }
+    if (detail.handle)
+        device->destroy_pipeline(detail);
 }
 
 void init_layout(a::device *device, uint32_t count, const a::pipeline_layout_param *params,
@@ -459,6 +497,8 @@ bool copy_descriptors(a::device *device, uint32_t count, const a::descriptor_tab
 void bind_tables(a::command_list *cmd, a::shader_stage stages, a::pipeline_layout layout,
                  uint32_t first, uint32_t count, const a::descriptor_table *tables)
 {
+    if ((stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0))
+        on_mask_list(cmd, [&](MaskList &list) { list.graphics_layout = layout.handle; });
     on_list(cmd, [&](List &list) {
         if ((stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0))
             list.graphics_layout = layout.handle;
@@ -515,6 +555,7 @@ void bind_pipeline(a::command_list *cmd, a::pipeline_stage stages, a::pipeline p
     on_mask_list(cmd, [&](MaskList &list) {
         const auto it = pipelines.find(pipeline.handle);
         list.pixel_shader = it != pipelines.end() ? it->second.pixel_shader : 0;
+        list.pipeline = pipeline;
     });
 }
 
@@ -648,9 +689,11 @@ bool is_mask_target(a::device *device, const MaskList &list, uint32_t width, uin
            (desc.texture.format == a::format::r8_typeless || desc.texture.format == a::format::r8_unorm);
 }
 
-struct ClearMask {
+struct MaskAction {
     a::resource_view target{};
     float value = 0;
+    a::pipeline original{};
+    a::pipeline detail{};
 };
 
 void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
@@ -674,7 +717,7 @@ void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
     }
 }
 
-ClearMask observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t element_count)
+MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t element_count)
 {
     on_list(cmd, [](List &list) {
         const auto it = pipelines.find(list.pipeline);
@@ -684,7 +727,7 @@ ClearMask observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t e
         append(list, line("draw", list.pipeline, shader, list.graphics_layout), true);
     });
 
-    ClearMask clear;
+    MaskAction action;
     on_mask_list(cmd, [&](MaskList &list) {
         const auto previous = std::exchange(list.stage, MaskStage::waiting);
         if (list.modified || instance_count != 1 || element_count == 0)
@@ -701,36 +744,52 @@ ClearMask observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t e
         } else if (list.pixel_shader == upsample_mask_shader && previous == MaskStage::blurred &&
                    GetForegroundWindow() == mask_probe.window &&
                    is_mask_target(device, list, probe_width, probe_height)) {
+            if (mask_probe.mode == MaskOverride::detail) {
+                const auto pipeline = pipelines.find(list.pipeline.handle);
+                if (pipeline == pipelines.end() || !pipeline->second.detail_ao.handle ||
+                    pipeline->second.layout != list.graphics_layout)
+                    return;
+                action.detail = pipeline->second.detail_ao;
+                action.original = list.pipeline;
+            }
             list.modified = true;
-            clear = {list.target, mask_probe.mode == MaskOverride::white ? 1.0f : 0.0f};
+            action.target = list.target;
+            action.value = mask_probe.mode == MaskOverride::white ? 1.0f : 0.0f;
         }
     });
-    return clear;
+    return action;
+}
+
+template <typename Draw>
+bool apply_mask(a::command_list *cmd, const MaskAction &action, const Draw &execute_draw)
+{
+    if (!action.target.handle)
+        return false;
+    // The add-on API records directly without re-entering the draw event.
+    // Binding all stages changes only the PSO on D3D12.
+    if (action.detail.handle)
+        cmd->bind_pipeline(a::pipeline_stage::all, action.detail);
+    execute_draw();
+    if (action.detail.handle) {
+        cmd->bind_pipeline(a::pipeline_stage::all, action.original);
+    } else {
+        const float color[]{action.value, action.value, action.value, action.value};
+        cmd->clear_render_target_view(action.target, color);
+    }
+    return true;
 }
 
 bool draw(a::command_list *cmd, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance)
 {
-    const auto clear = observe_draw(cmd, instances, vertices);
-    if (!clear.target.handle)
-        return false;
-    // The add-on API records directly on this DX12 list without re-entering the event.
-    // Preserve the native draw, then override only its single R8 target.
-    cmd->draw(vertices, instances, first, first_instance);
-    const float color[]{clear.value, clear.value, clear.value, clear.value};
-    cmd->clear_render_target_view(clear.target, color);
-    return true;
+    return apply_mask(cmd, observe_draw(cmd, instances, vertices),
+                      [&] { cmd->draw(vertices, instances, first, first_instance); });
 }
 
 bool draw_indexed(a::command_list *cmd, uint32_t indices, uint32_t instances, uint32_t first,
                   int32_t base, uint32_t first_instance)
 {
-    const auto clear = observe_draw(cmd, instances, indices);
-    if (!clear.target.handle)
-        return false;
-    cmd->draw_indexed(indices, instances, first, base, first_instance);
-    const float color[]{clear.value, clear.value, clear.value, clear.value};
-    cmd->clear_render_target_view(clear.target, color);
-    return true;
+    return apply_mask(cmd, observe_draw(cmd, instances, indices),
+                      [&] { cmd->draw_indexed(indices, instances, first, base, first_instance); });
 }
 
 bool dispatch(a::command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
@@ -795,6 +854,8 @@ void bundle(a::command_list *parent, a::command_list *child)
     on_mask_list(parent, [](MaskList &list) {
         list.stage = MaskStage::waiting;
         list.pixel_shader = 0;
+        list.graphics_layout = 0;
+        list.pipeline = {};
     });
     on_list(parent, [&](List &list) {
         const auto it = capture.lists.find(child);
@@ -824,9 +885,19 @@ void submit(a::command_queue *queue, a::command_list *cmd)
     on_mask_list(cmd, [&](MaskList &list) {
         if (list.modified && !mask_probe.reported) {
             mask_probe.reported = true;
-            message = mask_probe.mode == MaskOverride::white
-                ? "ZZZ AO mask probe submitted a white override."
-                : "ZZZ AO mask probe submitted a black override.";
+            switch (mask_probe.mode) {
+            case MaskOverride::detail:
+                message = "ZZZ AO submitted native detail AO.";
+                break;
+            case MaskOverride::white:
+                message = "ZZZ AO mask probe submitted a white override.";
+                break;
+            case MaskOverride::black:
+                message = "ZZZ AO mask probe submitted a black override.";
+                break;
+            case MaskOverride::off:
+                break;
+            }
         }
     });
     if (message)
@@ -903,9 +974,14 @@ void draw_settings(a::effect_runtime *runtime)
         controls = {runtime};
     controls.overlay_open = true;
 
+    if (ImGui::Checkbox("Native detail AO", &controls.detail_ao) && controls.detail_ao)
+        controls.mask_enabled = false;
     if (ImGui::Button(controls.mask_enabled ? "Disable mask test###mask_test"
-                                           : "Enable mask test###mask_test"))
+                                           : "Enable mask test###mask_test")) {
         controls.mask_enabled = !controls.mask_enabled;
+        if (controls.mask_enabled)
+            controls.detail_ao = false;
+    }
     if (controls.mask_enabled)
         ImGui::Checkbox("Black mask", &controls.black_mask);
 
@@ -949,9 +1025,13 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
         const std::lock_guard lock(mutex);
         const bool selected = focused && controls.runtime && controls.runtime->get_hwnd() == window &&
                               controls.runtime->get_device() == device;
-        const auto mode = selected && controls.mask_enabled
-            ? (controls.black_mask ? MaskOverride::black : MaskOverride::white)
-            : MaskOverride::off;
+        auto mode = MaskOverride::off;
+        if (selected) {
+            if (controls.detail_ao)
+                mode = MaskOverride::detail;
+            else if (controls.mask_enabled)
+                mode = controls.black_mask ? MaskOverride::black : MaskOverride::white;
+        }
         if ((selected || mask_probe.swapchain == swapchain) &&
             (mask_probe.mode != mode || (mode != MaskOverride::off && mask_probe.swapchain != swapchain))) {
             probe_missed = mask_probe.mode != MaskOverride::off && !mask_probe.reported;
@@ -1029,7 +1109,7 @@ void observe()
 } // namespace
 
 extern "C" __declspec(dllexport) const char *NAME = "ZZZ DX12 AO Capture";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Capture a DX12 trace or test the ZZZ 3.2 lighting mask from the add-on panel.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Native detail AO, mask testing and DX12 capture for ZZZ 3.2.";
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {
