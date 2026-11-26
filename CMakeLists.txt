@@ -40,16 +40,28 @@ add_custom_command(OUTPUT "${native_ao_header}" "${native_ao_dxil}"
         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/native_detail_ao.hlsl"
     DEPENDS shaders/native_detail_ao.hlsl
     VERBATIM)
-add_library(zzz_ao_capture MODULE src/capture.cpp src/depth_capture.cpp "${native_ao_header}")
+set(character_ao_header "${CMAKE_CURRENT_BINARY_DIR}/generated/character_ao_ps.hpp")
+add_custom_command(OUTPUT "${character_ao_header}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E CharacterVisibility -O3 -Ges -WX
+        -Fo "${CMAKE_CURRENT_BINARY_DIR}/generated/character_ao_ps.dxil"
+        -Fh "${character_ao_header}" -Vn character_ao_ps_bytecode
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/character_ao.hlsl"
+    DEPENDS shaders/character_ao.hlsl
+    VERBATIM)
+add_custom_target(zzz_ao_character_shader DEPENDS "${character_ao_header}")
+add_library(zzz_ao_capture MODULE src/capture.cpp src/depth_capture.cpp src/character_ao.cpp
+    "${native_ao_header}")
+add_dependencies(zzz_ao_capture zzz_ao_character_shader)
 target_include_directories(zzz_ao_capture PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}" "${IMGUI_INCLUDE_DIR}")
 target_compile_definitions(zzz_ao_capture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(zzz_ao_capture PRIVATE user32)
+target_link_libraries(zzz_ao_capture PRIVATE d3d12 user32)
 set_target_properties(zzz_ao_capture PROPERTIES
     PREFIX "" SUFFIX ".addon64"
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-option(ZZZ_AO_TEST_DEPTH_CAPTURE "Validate depth snapshot readback with D3D12 WARP" OFF)
+option(ZZZ_AO_TEST_DEPTH_CAPTURE "Validate depth readback and scene AO with D3D12 WARP" OFF)
 if(ZZZ_AO_TEST_DEPTH_CAPTURE)
     enable_testing()
     add_executable(zzz_ao_depth_capture_test tests/depth_capture_test.cpp src/depth_capture.cpp)
@@ -58,6 +70,32 @@ if(ZZZ_AO_TEST_DEPTH_CAPTURE)
     target_link_libraries(zzz_ao_depth_capture_test PRIVATE d3d12 dxgi)
     add_test(NAME depth_capture COMMAND zzz_ao_depth_capture_test)
     set_tests_properties(depth_capture PROPERTIES SKIP_RETURN_CODE 77)
+
+    set(scene_test_headers)
+    foreach(stage IN ITEMS vs ps)
+        if(stage STREQUAL "vs")
+            set(entry SceneVertex)
+        else()
+            set(entry SceneColor)
+        endif()
+        set(header "${CMAKE_CURRENT_BINARY_DIR}/generated/character_scene_${stage}.hpp")
+        list(APPEND scene_test_headers "${header}")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND "${DXC_EXECUTABLE}" -T "${stage}_6_0" -E "${entry}" -O3 -Ges -WX
+                -Fo "${CMAKE_CURRENT_BINARY_DIR}/generated/character_scene_${stage}.dxil"
+                -Fh "${header}" -Vn "character_scene_${stage}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/character_scene.hlsl"
+            DEPENDS tests/character_scene.hlsl
+            VERBATIM)
+    endforeach()
+    add_executable(zzz_ao_character_test tests/character_ao_test.cpp src/character_ao.cpp ${scene_test_headers})
+    add_dependencies(zzz_ao_character_test zzz_ao_character_shader)
+    target_include_directories(zzz_ao_character_test PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    target_compile_definitions(zzz_ao_character_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(zzz_ao_character_test PRIVATE d3d12 dxgi)
+    add_test(NAME character_ao COMMAND zzz_ao_character_test)
+    set_tests_properties(character_ao PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 option(ZZZ_AO_BUILD_COMPUTE "Build the XeGTAO backend and its DXIL shaders" ON)

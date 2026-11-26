@@ -10,7 +10,12 @@ on:
       - src/depth_capture.cpp
       - src/depth_capture.hpp
       - tests/depth_capture_test.cpp
+      - tests/character_ao_test.cpp
+      - tests/character_scene.hlsl
       - shaders/native_detail_ao.hlsl
+      - shaders/character_ao.hlsl
+      - src/character_ao.cpp
+      - src/character_ao.hpp
       - README.md
       - third_party/reshade/LICENSE.md
       - third_party/imgui/LICENSE.txt
@@ -33,8 +38,8 @@ jobs:
           if (!$dxc) { throw 'DirectX Shader Compiler was not found in the Windows SDK.' }
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF -DZZZ_AO_TEST_DEPTH_CAPTURE=ON "-DDXC_EXECUTABLE=$($dxc.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cmake --build build --config Release --target zzz_ao_capture zzz_ao_depth_capture_test
-      - name: Test D3D12 depth readback
+          cmake --build build --config Release --target zzz_ao_capture zzz_ao_depth_capture_test zzz_ao_character_test
+      - name: Test D3D12 depth readback and AO composition
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Package focused build
         run: |

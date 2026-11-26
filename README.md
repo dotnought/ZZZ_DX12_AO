@@ -1,6 +1,6 @@
 # ZZZ DX12 AO
 
-This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. The ReShade add-on panel can record a read-only trace. The add-on can replace the native visibility resolve for ZZZ 3.2 with an opt-in full-resolution detail AO shader. It also supports diagnostic mask overrides. The separate XeGTAO backend can record a replacement into the game's R8 mask format.
+The Windows x64 add-on provides two AO paths for ZZZ 3.2. **Character detail AO** blends local occlusion into the game's scene before DLSS. **Native detail AO** replaces the game's world visibility resolve. The add-on also supports diagnostic mask overrides and a read-only DX12 trace. The separate XeGTAO backend can record a replacement into the game's R8 mask format.
 
 ## Build on Windows 11
 
@@ -21,6 +21,14 @@ CMake downloads and verifies the pinned ReShade 6.7.3 and Dear ImGui 1.92.5 arch
 
 Configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` to build the add-on without the separate XeGTAO backend.
 
+## Character detail AO
+
+Replace the previous `zzz_ao_capture.addon64` in your add-on directory. At 3440×1440 with DLSS Performance, go to **Add-ons → ZZZ DX12 AO Capture** and turn on **Character detail AO**. The toggle starts off and can be changed during play. The ReShade log reports `ZZZ AO submitted character detail AO before upscaling` on the first matching submission.
+
+The character is already visible in the captured pre-AO depth. The before-upscale depth agrees with it at 309,368 of 309,600 sampled positions. In the earlier screenshots, changing the world visibility mask changed the curbs while producing little visible change on the character.
+
+The new pass reads the preserved native depth SRV used by the game's CapsuleAO compute shader and blends local contact occlusion into the internal scene color that the game later copies for DLSS. It uses the game's fullscreen vertex shader to align the depth samples with the scene. It targets RGB at 1720×720 before HUD composition, preserves alpha, and reuses the game's existing resource and sampler heaps. It records one extra draw at the matching scene-color pass. The stock world AO still runs, and the two add-on AO toggles select separate modes. The scene-color blend affects nearby world geometry as well as characters. The DX12 tests cover the blend and graphics state restoration. In-game appearance, Frame Generation behavior, and GPU time still need verification.
+
 ## Native detail AO
 
 At 3440×1440 with DLSS Performance, expand **Add-ons → ZZZ DX12 AO Capture** and toggle **Native detail AO**. Check hairlines, collars, layered clothing and curb edges in the same scene. Turn the toggle off to restore the stock shader. The ReShade log reports `ZZZ AO submitted native detail AO` when a matching draw is submitted.
@@ -38,8 +46,6 @@ All six scene recordings contain the same three consecutive pixel shaders produc
 To test the native mask, replace the old capture DLL with this build. In the same scene with DLSS Performance at 3440×1440, open the ReShade overlay and go to **Add-ons → ZZZ DX12 AO Capture**. Click **Enable mask test**, then compare the contact shading in the game. The probe writes white after the matching native draw. If you see no change, select **Black mask** in the panel and check again. Use **Disable mask test** to restore the native output. The ReShade log records the first matching submission for each setting. A brief description of what changed is enough for this test. If nothing changed, include whether the log reported an override.
 
 ## Character depth capture
-
-For the character comparison, leave DLSS Performance enabled and temporarily turn Frame Generation off so the capture uses the regular rendering and presentation path. Frame the character as you did for the screenshots. Click **Capture DX12 trace** and close the overlay. Send that single TSV from `%TEMP%`. The ordinary mask and detail AO toggles are independent of this diagnostic.
 
 At the observed 3.2 pre-upscale copy, the capture reads the game's preserved pre-AO depth and the live scene depth after later draws. It tracks both textures from the game's own depth copy and restores the live depth plane's state after the readback. No sampling runs outside an armed capture and the GPU fence is polled without a CPU wait. The TSV includes two `character_depth` rows containing stage, sample width, sample height and little-endian float32 depth samples in hexadecimal. It also saves bytecode for selected late scene shaders. The depth pair can show whether the character was already available to screen-space AO. It cannot identify every character material from depth alone.
 

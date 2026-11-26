@@ -3,6 +3,8 @@
 #include <reshade.hpp>
 
 #include "native_detail_ao.hpp"
+#include "character_ao.hpp"
+#include "character_ao_ps.hpp"
 #include "depth_capture.hpp"
 
 #include <algorithm>
@@ -51,6 +53,8 @@ struct Pipeline {
     uint64_t compute_shader = 0;
     uint64_t layout = 0;
     a::pipeline detail_ao{};
+    zzz_ao::CharacterAo character_ao;
+    a::format color_format = a::format::unknown;
 };
 
 // These fingerprints were present in the ZZZ 3.2 traces. Keep the cached
@@ -58,6 +62,7 @@ struct Pipeline {
 constexpr uint64_t half_mask_shader = 10793278501038871532ull;
 constexpr uint64_t blur_mask_shader = 18023612121467718113ull;
 constexpr uint64_t upsample_mask_shader = 9317972913748041275ull;
+constexpr uint64_t capsule_ao_shader = 2471263705428555365ull;
 constexpr uint64_t prescale_scene_shader = 7607800794214941815ull;
 struct NativeShader {
     uint64_t fingerprint;
@@ -69,7 +74,7 @@ constexpr auto native_shaders = std::to_array<NativeShader>({
     {blur_mask_shader, "ps_blur_mask"},
     {upsample_mask_shader, "ps_upsample_mask"},
     {16383356142044416029ull, "ps_lighting_candidate"},
-    {2471263705428555365ull, "cs_half_resolution_mask"},
+    {capsule_ao_shader, "cs_half_resolution_mask"},
     {15181696564642202686ull, "ps_after_world_lighting_1"},
     {11889072915614133341ull, "ps_after_world_lighting_2"},
     {12916642976149190619ull, "ps_late_scene_geometry"},
@@ -104,8 +109,20 @@ struct List {
 constexpr uint32_t probe_width = 1720;
 constexpr uint32_t probe_height = 720;
 
-enum class MaskOverride : uint8_t { off, white, black, detail };
+enum class MaskOverride : uint8_t { off, white, black, detail, character };
 enum class MaskStage : uint8_t { waiting, half, blurred };
+
+struct CharacterInputs {
+    a::resource depth_target{};
+    a::resource copy_candidate{};
+    a::resource early_depth{};
+    a::resource_usage depth_state = a::resource_usage::undefined;
+    uint64_t compute_layout = 0;
+    a::descriptor_table capsule_table{};
+    a::descriptor_table depth_srv{};
+    uint64_t depth_heap = 0;
+    std::array<a::descriptor_table, 3> graphics_tables{};
+};
 
 struct MaskList {
     uint64_t pixel_shader = 0;
@@ -118,6 +135,7 @@ struct MaskList {
     MaskStage stage = MaskStage::waiting;
     bool render_pass_open = false;
     bool modified = false;
+    CharacterInputs character;
 };
 
 struct MaskProbe {
@@ -131,6 +149,7 @@ struct MaskProbe {
 struct Controls {
     a::effect_runtime *runtime = nullptr;
     bool detail_ao = false;
+    bool character_ao = false;
     bool mask_enabled = false;
     bool black_mask = false;
     bool capture_requested = false;
@@ -322,7 +341,6 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
     const a::shader_desc *pixel_shader = nullptr;
     const a::shader_desc *compute_shader = nullptr;
     uint32_t pixel_index = 0;
-    bool mask_format = false;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &item = objects[i];
         if (item.count != 1 || item.data == nullptr)
@@ -337,10 +355,10 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
             info.compute_shader = fingerprint(*compute_shader);
         }
         if (item.type == a::pipeline_subobject_type::render_target_formats)
-            mask_format = *static_cast<const a::format *>(item.data) == a::format::r8_unorm;
+            info.color_format = *static_cast<const a::format *>(item.data);
     }
 
-    if (info.pixel_shader == upsample_mask_shader && layout.handle && mask_format) {
+    if (info.pixel_shader == upsample_mask_shader && layout.handle && info.color_format == a::format::r8_unorm) {
         // Reuse the native root signature, vertex shader and fixed-function
         // state. The replacement reads the same descriptor slots.
         std::vector<a::pipeline_subobject> replacement(objects, objects + count);
@@ -350,6 +368,38 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
         replacement[pixel_index].data = &detail;
         if (!device->create_pipeline(layout, count, replacement.data(), &info.detail_ao))
             log::message(log::level::warning, "ZZZ AO could not create the native detail AO pipeline.");
+    } else if (info.pixel_shader == prescale_scene_shader && layout.handle &&
+               (info.color_format == a::format::r8g8b8a8_unorm || info.color_format == a::format::r8g8b8a8_unorm_srgb)) {
+        auto ao = zzz_ao::CharacterAo::Create(reinterpret_cast<ID3D12Device *>(device->get_native()));
+        if (ao.Root()) {
+            std::vector<a::pipeline_subobject> replacement;
+            replacement.reserve(count + 1);
+            for (uint32_t i = 0; i < count; ++i) {
+                if (objects[i].type != a::pipeline_subobject_type::blend_state)
+                    replacement.push_back(objects[i]);
+            }
+            a::shader_desc visibility = *pixel_shader;
+            visibility.code = character_ao_ps_bytecode;
+            visibility.code_size = sizeof(character_ao_ps_bytecode);
+            const auto shader = std::ranges::find(replacement, a::pipeline_subobject_type::pixel_shader,
+                                                   &a::pipeline_subobject::type);
+            shader->data = &visibility;
+            a::blend_desc blend;
+            blend.blend_enable[0] = true;
+            blend.source_color_blend_factor[0] = a::blend_factor::zero;
+            blend.dest_color_blend_factor[0] = a::blend_factor::source_color;
+            blend.render_target_write_mask[0] = 0x7;
+            replacement.push_back({a::pipeline_subobject_type::blend_state, 1, &blend});
+            a::pipeline variant{};
+            const a::pipeline_layout character_root{reinterpret_cast<uint64_t>(ao.Root())};
+            if (device->create_pipeline(character_root, static_cast<uint32_t>(replacement.size()),
+                                        replacement.data(), &variant)) {
+                ao.Attach(reinterpret_cast<ID3D12PipelineState *>(variant.handle));
+                info.character_ao = std::move(ao);
+            }
+        }
+        if (!info.character_ao)
+            log::message(log::level::warning, "ZZZ AO could not create the character detail AO pipeline.");
     }
 
     try {
@@ -517,12 +567,31 @@ bool copy_descriptors(a::device *device, uint32_t count, const a::descriptor_tab
 void bind_tables(a::command_list *cmd, a::shader_stage stages, a::pipeline_layout layout,
                  uint32_t first, uint32_t count, const a::descriptor_table *tables)
 {
-    if ((stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0))
-        on_mask_list(cmd, [&](MaskList &list) { list.graphics_layout = layout.handle; });
-    on_list(cmd, [&](List &list) {
-        if ((stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0))
+    const bool graphics = (stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0);
+    const bool compute = (stages & a::shader_stage::compute) != static_cast<a::shader_stage>(0);
+    on_mask_list(cmd, [&](MaskList &list) {
+        auto &inputs = list.character;
+        if (graphics) {
+            if (mask_probe.mode == MaskOverride::character) {
+                if (list.graphics_layout != layout.handle)
+                    inputs.graphics_tables = {};
+                for (uint32_t i = 0; i < count && size_t(first) + i < inputs.graphics_tables.size(); ++i)
+                    inputs.graphics_tables[first + i] = tables[i];
+            }
             list.graphics_layout = layout.handle;
-        if ((stages & a::shader_stage::compute) != static_cast<a::shader_stage>(0))
+        }
+        if (compute && mask_probe.mode == MaskOverride::character) {
+            if (inputs.compute_layout != layout.handle)
+                inputs.capsule_table = {};
+            inputs.compute_layout = layout.handle;
+            if (count != 0 && first == 0)
+                inputs.capsule_table = tables[0];
+        }
+    });
+    on_list(cmd, [&](List &list) {
+        if (graphics)
+            list.graphics_layout = layout.handle;
+        if (compute)
             list.compute_layout = layout.handle;
 
         const auto signature = layouts.find(layout.handle);
@@ -601,9 +670,11 @@ void bind_targets(a::command_list *cmd, uint32_t count, const a::resource_view *
 {
     targets(cmd, "targets", count, colors, depth);
     on_mask_list(cmd, [&](MaskList &list) {
+        auto *device = cmd->get_device();
         list.target = count == 1 && depth.handle == 0 ? colors[0] : a::resource_view{};
-        list.target_resource = list.target.handle ? cmd->get_device()->get_resource_from_view(list.target)
-                                                  : a::resource{};
+        list.target_resource = list.target.handle ? device->get_resource_from_view(list.target) : a::resource{};
+        if (mask_probe.mode == MaskOverride::character)
+            list.character.depth_target = count == 4 && depth.handle ? device->get_resource_from_view(depth) : a::resource{};
     });
 }
 
@@ -618,6 +689,7 @@ void begin_pass(a::command_list *cmd, uint32_t count, const a::render_pass_rende
     on_mask_list(cmd, [](MaskList &list) {
         list.render_pass_open = true;
         list.stage = MaskStage::waiting;
+        list.character.depth_target = {};
     });
 }
 
@@ -652,6 +724,23 @@ void viewport(a::command_list *cmd, uint32_t first, uint32_t count, const a::vie
 void barrier(a::command_list *cmd, uint32_t count, const a::resource *res,
              const a::resource_usage *before, const a::resource_usage *after)
 {
+    on_mask_list(cmd, [&](MaskList &list) {
+        auto &inputs = list.character;
+        if (mask_probe.mode != MaskOverride::character)
+            return;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (res[i] == inputs.copy_candidate)
+                inputs.copy_candidate = {};
+            if (inputs.depth_target.handle && res[i] == inputs.depth_target &&
+                before[i] == a::resource_usage::depth_stencil_write && after[i] == a::resource_usage::copy_source)
+                inputs.copy_candidate = res[i];
+            if (inputs.early_depth.handle && res[i] == inputs.early_depth) {
+                inputs.depth_state = after[i];
+                if (after[i] == a::resource_usage::copy_dest || after[i] == a::resource_usage::undefined)
+                    inputs.depth_srv = {};
+            }
+        }
+    });
     on_list(cmd, [&](List &list) {
         for (uint32_t i = 0; i < count; ++i) {
             if (res[i] == list.depth_copy_candidate)
@@ -689,7 +778,7 @@ bool full_scene_depth(a::device *device, a::resource resource)
     const auto &desc = texture(device, resource).desc;
     return screen_texture(desc) && desc.texture.format == a::format::r32_g8_typeless &&
            desc.texture.width == probe_width && desc.texture.height == probe_height &&
-           desc.texture.samples == 1;
+           desc.texture.samples == 1 && desc.texture.levels == 1 && desc.texture.depth_or_layers == 1;
 }
 
 void record_character_depth(a::command_list *cmd, List &list, a::resource source, a::resource dest)
@@ -727,6 +816,17 @@ void record_character_depth(a::command_list *cmd, List &list, a::resource source
 
 bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
 {
+    on_mask_list(cmd, [&](MaskList &list) {
+        auto &inputs = list.character;
+        if (list.render_pass_open || !source.handle || source != inputs.copy_candidate)
+            return;
+        inputs.copy_candidate = {};
+        if (full_scene_depth(cmd->get_device(), source) && full_scene_depth(cmd->get_device(), dest)) {
+            inputs.early_depth = dest;
+            inputs.depth_state = a::resource_usage::copy_dest;
+            inputs.depth_srv = {};
+        }
+    });
     on_list(cmd, [&](List &list) {
         const auto from = emit_resource(cmd->get_device(), source);
         const auto to = emit_resource(cmd->get_device(), dest);
@@ -774,7 +874,90 @@ struct MaskAction {
     float value = 0;
     a::pipeline original{};
     a::pipeline detail{};
+    zzz_ao::CharacterAo character;
+    a::pipeline_layout layout{};
+    D3D12_GPU_DESCRIPTOR_HANDLE depth{};
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 3> tables{};
 };
+
+void keep_capsule_depth(a::device *device, const Pipeline &pipeline, CharacterInputs &inputs)
+{
+    if (!inputs.early_depth.handle || !inputs.capsule_table.handle || inputs.compute_layout != pipeline.layout)
+        return;
+    const auto layout = layouts.find(pipeline.layout);
+    if (layout == layouts.end() || layout->second.size() != 2 || layout->second[0].size() != 2)
+        return;
+    const auto &range = layout->second[0][0];
+    if (!is_srv(range.type) || range.binding != 0 || range.dx_register_index != 0 ||
+        range.dx_register_space != 0 || range.count != 4)
+        return;
+
+    // The captured CapsuleAO shader reconstructs position from t1.x. Its
+    // four-SRV table is placed alongside the preserved native depth barriers.
+    const auto slot = heap_slot(device, inputs.capsule_table, 1);
+    if (!slot.capacity ||
+        (inputs.depth_state & a::resource_usage::shader_resource_non_pixel) == a::resource_usage::undefined)
+        return;
+    if (const auto tracked = descriptors.find(slot.key()); tracked != descriptors.end()) {
+        const auto &descriptor = tracked->second;
+        if (descriptor.resource != inputs.early_depth.handle || descriptor.format != a::format::r32_float_x8_uint)
+            return;
+    }
+    UINT increment = reinterpret_cast<ID3D12Device *>(device->get_native())
+                         ->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    inputs.depth_srv = {inputs.capsule_table.handle + increment};
+    inputs.depth_heap = slot.heap;
+}
+
+bool prescale_layout_can_restore(uint64_t handle)
+{
+    const auto layout = layouts.find(handle);
+    if (layout == layouts.end())
+        return false;
+    const auto &params = layout->second;
+    return params.size() == 3 && params[0].size() == 1 && params[1].size() == 2 && params[2].size() == 1 &&
+           params[0][0].type == a::descriptor_type::constant_buffer && params[0][0].count == 2 &&
+           params[0][0].binding == 0 && params[0][0].dx_register_index == 0 &&
+           params[0][0].dx_register_space == 0 && params[0][0].visibility == a::shader_stage::vertex &&
+           is_srv(params[1][0].type) && params[1][0].count == 6 &&
+           params[1][1].type == a::descriptor_type::constant_buffer && params[1][1].count == 2 &&
+           params[2][0].type == a::descriptor_type::sampler && params[2][0].count == 4;
+}
+
+void prepare_character_draw(a::device *device, const MaskList &list, MaskAction &action)
+{
+    const auto &inputs = list.character;
+    const auto &v = list.viewport;
+    if (!list.target_resource.handle || list.render_pass_open || !inputs.depth_srv.handle ||
+        (inputs.depth_state & a::resource_usage::shader_resource_pixel) == a::resource_usage::undefined ||
+        v.x != 0 || v.y != 0 || v.width != probe_width || v.height != probe_height ||
+        std::ranges::any_of(inputs.graphics_tables, [](a::descriptor_table t) { return t.handle == 0; }))
+        return;
+
+    const auto pipeline = pipelines.find(list.pipeline.handle);
+    if (pipeline == pipelines.end() || !pipeline->second.character_ao || pipeline->second.layout != list.graphics_layout ||
+        !prescale_layout_can_restore(list.graphics_layout))
+        return;
+    const auto &desc = texture(device, list.target_resource).desc;
+    const auto view = device->get_resource_view_desc(list.target);
+    if (!screen_texture(desc) || desc.texture.width != probe_width || desc.texture.height != probe_height ||
+        desc.texture.samples != 1 || desc.texture.levels != 1 || desc.texture.depth_or_layers != 1 ||
+        device->get_resource_from_view(list.target) != list.target_resource ||
+        view.type != a::resource_view_type::texture_2d || view.format != pipeline->second.color_format ||
+        view.texture.first_level != 0 || view.texture.first_layer != 0)
+        return;
+
+    // The pre-upscale pass and CapsuleAO must use the same bound resource heap.
+    if (heap_slot(device, inputs.graphics_tables[1], 0).heap != inputs.depth_heap)
+        return;
+    action.target = list.target;
+    action.original = list.pipeline;
+    action.character = pipeline->second.character_ao;
+    action.layout = {list.graphics_layout};
+    action.depth = {inputs.depth_srv.handle};
+    for (size_t i = 0; i < action.tables.size(); ++i)
+        action.tables[i] = {inputs.graphics_tables[i].handle};
+}
 
 void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
 {
@@ -801,11 +984,11 @@ MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t 
 {
     on_list(cmd, [](List &list) {
         const auto it = pipelines.find(list.pipeline);
-        const Pipeline pipeline = it != pipelines.end() ? it->second : Pipeline{};
-        const uint64_t shader = pipeline.pixel_shader;
+        const uint64_t shader = it != pipelines.end() ? it->second.pixel_shader : 0;
+        const uint64_t layout = it != pipelines.end() ? it->second.layout : 0;
         if (shader == prescale_scene_shader && list.before_ao_depth.handle)
             list.prescale_scene_seen = true;
-        mark_native_shader(list, shader, list.graphics_layout ? list.graphics_layout : pipeline.layout);
+        mark_native_shader(list, shader, list.graphics_layout ? list.graphics_layout : layout);
         append(list, line("draw", list.pipeline, shader, list.graphics_layout), true);
     });
 
@@ -816,6 +999,12 @@ MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t 
             return;
 
         auto *device = cmd->get_device();
+        if (mask_probe.mode == MaskOverride::character) {
+            if (list.pixel_shader == prescale_scene_shader && GetForegroundWindow() == mask_probe.window)
+                prepare_character_draw(device, list, action);
+            list.modified = action.target.handle != 0;
+            return;
+        }
         if (list.pixel_shader == half_mask_shader &&
             is_mask_target(device, list, probe_width / 2, probe_height / 2)) {
             list.stage = MaskStage::half;
@@ -852,7 +1041,13 @@ bool apply_mask(a::command_list *cmd, const MaskAction &action, const Draw &exec
     if (action.detail.handle)
         cmd->bind_pipeline(a::pipeline_stage::all, action.detail);
     execute_draw();
-    if (action.detail.handle) {
+    if (action.character) {
+        auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+        action.character.Bind(list, action.tables[0], action.depth);
+        execute_draw();
+        zzz_ao::CharacterAo::Restore(list, reinterpret_cast<ID3D12PipelineState *>(action.original.handle),
+                                    reinterpret_cast<ID3D12RootSignature *>(action.layout.handle), action.tables);
+    } else if (action.detail.handle) {
         cmd->bind_pipeline(a::pipeline_stage::all, action.original);
     } else {
         const float color[]{action.value, action.value, action.value, action.value};
@@ -876,12 +1071,20 @@ bool draw_indexed(a::command_list *cmd, uint32_t indices, uint32_t instances, ui
 
 bool dispatch(a::command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
 {
-    on_mask_list(cmd, [](MaskList &list) { list.stage = MaskStage::waiting; });
+    on_mask_list(cmd, [&](MaskList &list) {
+        list.stage = MaskStage::waiting;
+        if (mask_probe.mode != MaskOverride::character ||
+            x != (probe_width + 31) / 32 || y != (probe_height + 31) / 32 || z != 1)
+            return;
+        const auto pipeline = pipelines.find(list.pipeline.handle);
+        if (pipeline != pipelines.end() && pipeline->second.compute_shader == capsule_ao_shader)
+            keep_capsule_depth(cmd->get_device(), pipeline->second, list.character);
+    });
     on_list(cmd, [&](List &list) {
         const auto it = pipelines.find(list.pipeline);
-        const Pipeline pipeline = it != pipelines.end() ? it->second : Pipeline{};
-        const uint64_t shader = pipeline.compute_shader;
-        mark_native_shader(list, shader, list.compute_layout ? list.compute_layout : pipeline.layout);
+        const uint64_t shader = it != pipelines.end() ? it->second.compute_shader : 0;
+        const uint64_t layout = it != pipelines.end() ? it->second.layout : 0;
+        mark_native_shader(list, shader, list.compute_layout ? list.compute_layout : layout);
         append(list, line("dispatch", list.pipeline, shader, list.compute_layout, x, y, z), true);
     });
     return false;
@@ -946,6 +1149,7 @@ void bundle(a::command_list *parent, a::command_list *child)
         list.pixel_shader = 0;
         list.graphics_layout = 0;
         list.pipeline = {};
+        list.character = {};
     });
     on_list(parent, [&](List &list) {
         const auto it = capture.lists.find(child);
@@ -980,6 +1184,9 @@ void submit(a::command_queue *queue, a::command_list *cmd)
         if (list.modified && !mask_probe.reported) {
             mask_probe.reported = true;
             switch (mask_probe.mode) {
+            case MaskOverride::character:
+                message = "ZZZ AO submitted character detail AO before upscaling.";
+                break;
             case MaskOverride::detail:
                 message = "ZZZ AO submitted native detail AO.";
                 break;
@@ -1079,13 +1286,21 @@ void draw_settings(a::effect_runtime *runtime)
         controls = {runtime};
     controls.overlay_open = true;
 
-    if (ImGui::Checkbox("Native detail AO", &controls.detail_ao) && controls.detail_ao)
+    if (ImGui::Checkbox("Character detail AO", &controls.character_ao) && controls.character_ao) {
+        controls.detail_ao = false;
         controls.mask_enabled = false;
+    }
+    if (ImGui::Checkbox("Native detail AO", &controls.detail_ao) && controls.detail_ao) {
+        controls.character_ao = false;
+        controls.mask_enabled = false;
+    }
     if (ImGui::Button(controls.mask_enabled ? "Disable mask test###mask_test"
                                            : "Enable mask test###mask_test")) {
         controls.mask_enabled = !controls.mask_enabled;
-        if (controls.mask_enabled)
+        if (controls.mask_enabled) {
             controls.detail_ao = false;
+            controls.character_ao = false;
+        }
     }
     if (controls.mask_enabled)
         ImGui::Checkbox("Black mask", &controls.black_mask);
@@ -1144,7 +1359,9 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
                               controls.runtime->get_device() == device;
         auto mode = MaskOverride::off;
         if (selected) {
-            if (controls.detail_ao)
+            if (controls.character_ao)
+                mode = MaskOverride::character;
+            else if (controls.detail_ao)
                 mode = MaskOverride::detail;
             else if (controls.mask_enabled)
                 mode = controls.black_mask ? MaskOverride::black : MaskOverride::white;

@@ -1,0 +1,269 @@
+#include "character_ao.hpp"
+#include "character_ao_ps.hpp"
+#include "character_scene_ps.hpp"
+#include "character_scene_vs.hpp"
+
+#include <d3d12sdklayers.h>
+#include <dxgi1_4.h>
+
+#include <cstdint>
+#include <iostream>
+#include <memory>
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+constexpr UINT extent = 32;
+constexpr DXGI_FORMAT color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr D3D12_RESOURCE_DESC color_desc{
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, extent, extent, 1, 1, color_format,
+    {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+};
+
+ComPtr<ID3D12Resource> Allocate(ID3D12Device *device, D3D12_HEAP_TYPE type,
+                               const D3D12_RESOURCE_DESC &desc, D3D12_RESOURCE_STATES state)
+{
+    const D3D12_HEAP_PROPERTIES heap{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    ComPtr<ID3D12Resource> result;
+    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&result));
+    return result;
+}
+
+ComPtr<ID3D12DescriptorHeap> MakeHeap(ID3D12Device *device, D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count,
+                                      D3D12_DESCRIPTOR_HEAP_FLAGS flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE)
+{
+    const D3D12_DESCRIPTOR_HEAP_DESC desc{type, count, flags, 0};
+    ComPtr<ID3D12DescriptorHeap> result;
+    device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&result));
+    return result;
+}
+
+void Transition(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
+                D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
+{
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {res, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+    list->ResourceBarrier(1, &barrier);
+}
+
+ComPtr<ID3D12RootSignature> OriginalRoot(ID3D12Device *device)
+{
+    const D3D12_DESCRIPTOR_RANGE ranges[]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 2, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0},
+    };
+    D3D12_ROOT_PARAMETER params[3]{};
+    for (UINT i = 0; i < 3; ++i) {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[i].DescriptorTable = {1, &ranges[i]};
+        params[i].ShaderVisibility = i == 0 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    const D3D12_ROOT_SIGNATURE_DESC desc{3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ComPtr<ID3DBlob> blob;
+    ComPtr<ID3D12RootSignature> result;
+    if (SUCCEEDED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr)))
+        device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&result));
+    return result;
+}
+
+ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignature *root, bool composite)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = root;
+    desc.VS = {character_scene_vs, sizeof(character_scene_vs)};
+    desc.PS = composite ? D3D12_SHADER_BYTECODE{character_ao_ps_bytecode, sizeof(character_ao_ps_bytecode)}
+                        : D3D12_SHADER_BYTECODE{character_scene_ps, sizeof(character_scene_ps)};
+    desc.BlendState.RenderTarget[0] = {composite, FALSE, composite ? D3D12_BLEND_ZERO : D3D12_BLEND_ONE,
+        composite ? D3D12_BLEND_SRC_COLOR : D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
+        static_cast<UINT8>(composite ? 0x7 : 0xf)};
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.SampleMask = UINT_MAX;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = color_format;
+    desc.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pso;
+    device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    return pso;
+}
+
+} // namespace
+
+int main()
+{
+    ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+        debug->EnableDebugLayer();
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter> warp;
+    ComPtr<ID3D12Device> device;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) ||
+        FAILED(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+        return 77;
+
+    auto native_root = OriginalRoot(device.Get());
+    auto ao = zzz_ao::CharacterAo::Create(device.Get());
+    if (!native_root || !ao.Root())
+        return 1;
+    auto native = MakePipeline(device.Get(), native_root.Get(), false);
+    ao.Attach(MakePipeline(device.Get(), ao.Root(), true).Detach());
+    if (!native || !ao)
+        return 1;
+
+    auto depth_desc = color_desc;
+    depth_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    auto depth = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    auto color = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto later = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto rtvs = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2);
+    auto dsvs = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
+    auto resources = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
+                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+    auto samplers = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    UINT64 size = 0;
+    device->GetCopyableFootprints(&color_desc, 0, 1, 0, &layout, nullptr, nullptr, &size);
+    const UINT64 stride = (size + 511) & ~511ull;
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, stride * 2, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+                                     {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
+    auto readback = Allocate(device.Get(), D3D12_HEAP_TYPE_READBACK, buffer, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto constants = Allocate(device.Get(), D3D12_HEAP_TYPE_UPLOAD, buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!depth || !color || !later || !rtvs || !dsvs || !resources || !samplers || !readback || !constants)
+        return 1;
+
+    void *mapped = nullptr;
+    if (FAILED(constants->Map(0, nullptr, &mapped)))
+        return 1;
+    static_cast<float *>(mapped)[0] = static_cast<float *>(mapped)[1] = 1.0f;
+    constants->Unmap(0, nullptr);
+
+    auto scene_rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
+    auto later_rtv = scene_rtv;
+    later_rtv.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    device->CreateRenderTargetView(color.Get(), nullptr, scene_rtv);
+    device->CreateRenderTargetView(later.Get(), nullptr, later_rtv);
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    const auto dsv_handle = dsvs->GetCPUDescriptorHandleForHeapStart();
+    device->CreateDepthStencilView(depth.Get(), &dsv, dsv_handle);
+
+    auto resource_cpu = resources->GetCPUDescriptorHandleForHeapStart();
+    const auto resource_gpu = resources->GetGPUDescriptorHandleForHeapStart();
+    const auto increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{constants->GetGPUVirtualAddress(), 256};
+    for (int i = 0; i < 2; ++i) {
+        device->CreateConstantBufferView(&cbv, resource_cpu);
+        resource_cpu.ptr += increment;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(depth.Get(), &srv, resource_cpu);
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    device->CreateSampler(&sampler, samplers->GetCPUDescriptorHandleForHeapStart());
+
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), native.Get(),
+                                         IID_PPV_ARGS(&list))) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
+        return 1;
+    const D3D12_RECT crease{12, 0, 19, 16};
+    const D3D12_RECT silhouette{12, 16, 19, 32};
+    list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
+    list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.253f, 0, 1, &crease);
+    list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.7f, 0, 1, &silhouette);
+    Transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const float scene_color[]{0.8f, 0.8f, 0.8f, 0.25f};
+    list->ClearRenderTargetView(scene_rtv, scene_color, 0, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, extent, extent, 0, 1};
+    const D3D12_RECT scissor{0, 0, extent, extent};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12DescriptorHeap *active_heaps[]{resources.Get(), samplers.Get()};
+    list->SetDescriptorHeaps(2, active_heaps);
+    const std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 3> tables{
+        resource_gpu, {resource_gpu.ptr + 2 * increment}, samplers->GetGPUDescriptorHandleForHeapStart()
+    };
+    list->SetGraphicsRootSignature(native_root.Get());
+    for (UINT i = 0; i < tables.size(); ++i)
+        list->SetGraphicsRootDescriptorTable(i, tables[i]);
+    list->OMSetRenderTargets(1, &scene_rtv, FALSE, nullptr);
+    ao.Bind(list.Get(), tables[0], tables[1]);
+    list->DrawInstanced(3, 1, 0, 0);
+    zzz_ao::CharacterAo::Restore(list.Get(), native.Get(), native_root.Get(), tables);
+    list->OMSetRenderTargets(1, &later_rtv, FALSE, nullptr);
+    list->DrawInstanced(3, 1, 0, 0);
+
+    for (ID3D12Resource *result : {color.Get(), later.Get()}) {
+        Transition(list.Get(), result, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const D3D12_TEXTURE_COPY_LOCATION src{result, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+        D3D12_TEXTURE_COPY_LOCATION dest{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+        dest.PlacedFootprint = layout;
+        list->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+        layout.Offset += stride;
+    }
+    if (FAILED(list->Close()))
+        return 1;
+    ID3D12CommandList *lists[]{list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence.Get(), 1)))
+        return 1;
+    for (int i = 0; i < 2000 && fence->GetCompletedValue() == 0; ++i)
+        Sleep(5);
+    const D3D12_RANGE read{0, static_cast<SIZE_T>(stride * 2)};
+    if (fence->GetCompletedValue() != 1 || FAILED(readback->Map(0, &read, &mapped)))
+        return 1;
+    const auto pixel = [&](UINT x, UINT y, UINT64 offset = 0) {
+        return static_cast<const uint8_t *>(mapped) + offset + y * layout.Footprint.RowPitch + x * 4;
+    };
+    const bool correct = pixel(2, 8)[0] == 204 && pixel(11, 8)[0] < 190 && pixel(11, 8)[3] == 64 &&
+                         pixel(11, 24)[0] == 204 && pixel(4, 8, stride)[0] == 64 &&
+                         pixel(4, 8, stride)[1] == 128 && pixel(4, 8, stride)[2] == 191;
+    const D3D12_RANGE written{0, 0};
+    readback->Unmap(0, &written);
+    if (!correct) {
+        std::cerr << "Unexpected scene-color blend or restored draw.\n";
+        return 1;
+    }
+    ComPtr<ID3D12InfoQueue> info;
+    if (SUCCEEDED(device.As(&info))) {
+        for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {
+            SIZE_T size = 0;
+            if (FAILED(info->GetMessage(i, nullptr, &size)))
+                return 1;
+            auto bytes = std::make_unique<char[]>(size);
+            auto *message = reinterpret_cast<D3D12_MESSAGE *>(bytes.get());
+            if (FAILED(info->GetMessage(i, message, &size)))
+                return 1;
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                std::cerr << message->pDescription << '\n';
+                return 1;
+            }
+        }
+    }
+    std::cout << "Verified depth occlusion, untouched alpha and the restored graphics draw through D3D12 WARP.\n";
+    return 0;
+}
