@@ -3,7 +3,9 @@
 #include <reshade.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bitset>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -43,7 +45,28 @@ struct Descriptor {
 struct Pipeline {
     uint64_t pixel_shader = 0;
     uint64_t compute_shader = 0;
+    uint64_t layout = 0;
 };
+
+// These fingerprints were present in the ZZZ 3.2 traces. Keep the cached
+// shader contracts limited to the observed depth and native mask sequence.
+constexpr uint64_t half_mask_shader = 10793278501038871532ull;
+constexpr uint64_t blur_mask_shader = 18023612121467718113ull;
+constexpr uint64_t upsample_mask_shader = 9317972913748041275ull;
+struct NativeShader {
+    uint64_t fingerprint;
+    const char *name;
+};
+constexpr auto native_shaders = std::to_array<NativeShader>({
+    {6709996353822950300ull, "ps_before_half_mask"},
+    {half_mask_shader, "ps_half_mask"},
+    {blur_mask_shader, "ps_blur_mask"},
+    {upsample_mask_shader, "ps_upsample_mask"},
+    {16383356142044416029ull, "ps_lighting_candidate"},
+    {2471263705428555365ull, "cs_half_resolution_mask"},
+});
+constexpr size_t max_native_shader_bytes = 256 * 1024;
+using NativeShaderSet = std::bitset<native_shaders.size()>;
 
 struct Row {
     std::string text;
@@ -56,12 +79,9 @@ struct List {
     uint64_t compute_layout = 0;
     size_t dropped = 0;
     std::vector<Row> rows;
+    NativeShaderSet native_shaders_seen;
 };
 
-// ZZZ 3.2 produced this sequence in all six rendered frames of the supplied traces.
-constexpr uint64_t half_mask_shader = 10793278501038871532ull;
-constexpr uint64_t blur_mask_shader = 18023612121467718113ull;
-constexpr uint64_t upsample_mask_shader = 9317972913748041275ull;
 constexpr uint32_t probe_width = 1720;
 constexpr uint32_t probe_height = 720;
 
@@ -114,6 +134,7 @@ struct Capture {
     std::unordered_map<a::command_list *, List> lists;
     std::unordered_set<uint64_t> emitted_textures;
     std::vector<std::string> rows;
+    NativeShaderSet native_shaders_seen;
 };
 
 std::atomic_bool capturing{false};
@@ -124,6 +145,7 @@ std::mutex mutex;
 Capture capture;
 std::unordered_map<uint64_t, Texture> textures;
 std::unordered_map<uint64_t, Pipeline> pipelines;
+std::array<std::vector<uint8_t>, native_shaders.size()> native_shader_code;
 std::unordered_map<uint64_t, std::vector<std::vector<a::descriptor_range>>> layouts;
 std::unordered_map<uint64_t, Descriptor> descriptors;
 uint64_t next_texture_id = 0;
@@ -247,23 +269,49 @@ uint64_t fingerprint(const a::shader_desc &shader)
     return hash;
 }
 
-void init_pipeline(a::device *device, a::pipeline_layout, uint32_t count,
+size_t native_shader_index(uint64_t fingerprint)
+{
+    return static_cast<size_t>(std::find_if(native_shaders.begin(), native_shaders.end(),
+        [&](const NativeShader &shader) { return shader.fingerprint == fingerprint; }) - native_shaders.begin());
+}
+
+void cache_native_shader(uint64_t hash, const a::shader_desc *shader)
+{
+    const size_t index = native_shader_index(hash);
+    if (index == native_shaders.size() || !shader || !shader->code ||
+        shader->code_size == 0 || shader->code_size > max_native_shader_bytes ||
+        !native_shader_code[index].empty())
+        return;
+    const auto *bytes = static_cast<const uint8_t *>(shader->code);
+    native_shader_code[index].assign(bytes, bytes + shader->code_size);
+}
+
+void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
                    const a::pipeline_subobject *objects, a::pipeline pipeline)
 {
     if (!dx12(device))
         return;
     Pipeline info;
+    info.layout = layout.handle;
+    const a::shader_desc *pixel_shader = nullptr;
+    const a::shader_desc *compute_shader = nullptr;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &item = objects[i];
         if (item.count != 1 || item.data == nullptr)
             continue;
-        if (item.type == a::pipeline_subobject_type::pixel_shader)
-            info.pixel_shader = fingerprint(*static_cast<const a::shader_desc *>(item.data));
-        if (item.type == a::pipeline_subobject_type::compute_shader)
-            info.compute_shader = fingerprint(*static_cast<const a::shader_desc *>(item.data));
+        if (item.type == a::pipeline_subobject_type::pixel_shader) {
+            pixel_shader = static_cast<const a::shader_desc *>(item.data);
+            info.pixel_shader = fingerprint(*pixel_shader);
+        }
+        if (item.type == a::pipeline_subobject_type::compute_shader) {
+            compute_shader = static_cast<const a::shader_desc *>(item.data);
+            info.compute_shader = fingerprint(*compute_shader);
+        }
     }
     const std::lock_guard lock(mutex);
     pipelines.insert_or_assign(pipeline.handle, info);
+    cache_native_shader(info.pixel_shader, pixel_shader);
+    cache_native_shader(info.compute_shader, compute_shader);
 }
 
 void destroy_pipeline(a::device *device, a::pipeline pipeline)
@@ -605,12 +653,35 @@ struct ClearMask {
     float value = 0;
 };
 
+void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
+{
+    const size_t index = native_shader_index(shader);
+    if (index == native_shaders.size() || list.native_shaders_seen.test(index))
+        return;
+
+    list.native_shaders_seen.set(index);
+    const auto signature = layouts.find(layout);
+    if (signature == layouts.end())
+        return;
+
+    for (size_t parameter = 0; parameter < signature->second.size(); ++parameter) {
+        for (const auto &range : signature->second[parameter]) {
+            append(list, line("native_ao_binding", shader, layout, parameter,
+                              static_cast<uint32_t>(range.type), range.binding,
+                              range.dx_register_index, range.dx_register_space, range.count,
+                              static_cast<uint32_t>(range.visibility)));
+        }
+    }
+}
+
 ClearMask observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t element_count)
 {
     on_list(cmd, [](List &list) {
         const auto it = pipelines.find(list.pipeline);
-        append(list, line("draw", list.pipeline, it != pipelines.end() ? it->second.pixel_shader : 0,
-                          list.graphics_layout), true);
+        const Pipeline pipeline = it != pipelines.end() ? it->second : Pipeline{};
+        const uint64_t shader = pipeline.pixel_shader;
+        mark_native_shader(list, shader, list.graphics_layout ? list.graphics_layout : pipeline.layout);
+        append(list, line("draw", list.pipeline, shader, list.graphics_layout), true);
     });
 
     ClearMask clear;
@@ -667,8 +738,10 @@ bool dispatch(a::command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
     on_mask_list(cmd, [](MaskList &list) { list.stage = MaskStage::waiting; });
     on_list(cmd, [&](List &list) {
         const auto it = pipelines.find(list.pipeline);
-        append(list, line("dispatch", list.pipeline, it != pipelines.end() ? it->second.compute_shader : 0,
-                          list.compute_layout, x, y, z), true);
+        const Pipeline pipeline = it != pipelines.end() ? it->second : Pipeline{};
+        const uint64_t shader = pipeline.compute_shader;
+        mark_native_shader(list, shader, list.compute_layout ? list.compute_layout : pipeline.layout);
+        append(list, line("dispatch", list.pipeline, shader, list.compute_layout, x, y, z), true);
     });
     return false;
 }
@@ -729,6 +802,7 @@ void bundle(a::command_list *parent, a::command_list *child)
         if (it != capture.lists.end() && child != parent) {
             const List &recorded = it->second;
             list.dropped += recorded.dropped;
+            list.native_shaders_seen |= recorded.native_shaders_seen;
             for (const auto &row : recorded.rows) {
                 if (list.rows.size() < max_list_rows && capture.live_rows < max_live_rows) {
                     list.rows.push_back(row);
@@ -770,10 +844,37 @@ void submit(a::command_queue *queue, a::command_list *cmd)
         ++capture.unobserved_lists;
         return;
     }
+    capture.native_shaders_seen |= it->second.native_shaders_seen;
     for (const auto &row : it->second.rows)
         append_trace(row.text + '\t' + std::to_string(row.repeat));
     if (it->second.dropped)
         append_trace(line("list_truncated", it->second.dropped));
+}
+
+void save_native_shaders(std::ofstream &out, NativeShaderSet observed)
+{
+    std::array<std::vector<uint8_t>, native_shaders.size()> shaders;
+    {
+        const std::lock_guard lock(mutex);
+        for (size_t i = 0; i < shaders.size(); ++i)
+            if (observed.test(i))
+                shaders[i] = native_shader_code[i];
+    }
+
+    constexpr char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < shaders.size(); ++i) {
+        if (!observed.test(i))
+            continue;
+        const auto &shader = native_shaders[i];
+        std::string hex;
+        hex.reserve(shaders[i].size() * 2);
+        for (uint8_t byte : shaders[i]) {
+            hex += digits[byte >> 4];
+            hex += digits[byte & 15];
+        }
+        out << "native_ao_shader\t" << shader.name << '\t' << shader.fingerprint
+            << '\t' << shaders[i].size() << '\t' << hex << '\n';
+    }
 }
 
 void save(Capture &finished)
@@ -783,6 +884,7 @@ void save(Capture &finished)
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     for (const auto &row : finished.rows)
         out << row << '\n';
+    save_native_shaders(out, finished.native_shaders_seen);
     out << line("summary", finished.presents, finished.unobserved_lists, finished.dropped) << '\n';
     out.close();
     if (out)

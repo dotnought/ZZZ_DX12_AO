@@ -143,6 +143,15 @@ bool valid_normal_srv(DXGI_FORMAT resource, DXGI_FORMAT srv)
     }
 }
 
+bool valid_native_mask(const D3D12_RESOURCE_DESC &desc, const Frame &frame)
+{
+    return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+           desc.Width == frame.width && desc.Height == frame.height &&
+           desc.DepthOrArraySize == 1 && desc.MipLevels == 1 && desc.SampleDesc.Count == 1 &&
+           (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+           (desc.Format == DXGI_FORMAT_R8_TYPELESS || desc.Format == DXGI_FORMAT_R8_UNORM);
+}
+
 bool valid_projection(const Projection &p)
 {
     return std::isfinite(p.depth_numerator) && p.depth_numerator != 0.0f &&
@@ -438,6 +447,21 @@ XeGtaoDx12::~XeGtaoDx12() = default;
 HRESULT XeGtaoDx12::Record(ID3D12GraphicsCommandList *list, uint32_t i, const Frame &frame,
                             const Settings &settings)
 {
+    return RecordInternal(list, i, frame, settings, nullptr);
+}
+
+HRESULT XeGtaoDx12::RecordToNativeMask(ID3D12GraphicsCommandList *list, uint32_t i,
+                                      const Frame &frame, const Settings &settings,
+                                      ID3D12Resource *native_mask)
+{
+    if (!native_mask)
+        return E_INVALIDARG;
+    return RecordInternal(list, i, frame, settings, native_mask);
+}
+
+HRESULT XeGtaoDx12::RecordInternal(ID3D12GraphicsCommandList *list, uint32_t i, const Frame &frame,
+                                    const Settings &settings, ID3D12Resource *native_mask)
+{
     if (!settings.enabled || settings.intensity == 0.0f)
         return S_FALSE;
     auto &impl = *impl_;
@@ -447,6 +471,14 @@ HRESULT XeGtaoDx12::Record(ID3D12GraphicsCommandList *list, uint32_t i, const Fr
         padded(frame.width) != impl.width || padded(frame.height) != impl.height ||
         !valid_projection(frame.projection) || !valid_settings(settings))
         return E_INVALIDARG;
+
+    if (native_mask) {
+        ComPtr<ID3D12Device> mask_device;
+        if (!valid_native_mask(native_mask->GetDesc(), frame) ||
+            FAILED(native_mask->GetDevice(IID_PPV_ARGS(&mask_device))) ||
+            mask_device.Get() != impl.device.Get())
+            return E_INVALIDARG;
+    }
 
     const auto depth_desc = frame.depth->GetDesc();
     if (!rect_fits(depth_desc, frame) || !valid_depth_srv(depth_desc.Format, frame.depth_srv_format))
@@ -494,6 +526,31 @@ HRESULT XeGtaoDx12::Record(ID3D12GraphicsCommandList *list, uint32_t i, const Fr
     auto final_barrier = transition(slot.output.Get(), output_state, uav);
     impl.run(list, i, settings.denoise_passes == 2 ? final_b : final_a, final_cs,
              impl.width / 16, impl.height / 8, &final_barrier, 1);
+
+    if (native_mask) {
+        const D3D12_RESOURCE_BARRIER to_copy[]{
+            transition(slot.output.Get(), output_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(native_mask, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        const D3D12_TEXTURE_COPY_LOCATION source{
+            slot.output.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0},
+        };
+        const D3D12_TEXTURE_COPY_LOCATION destination{
+            native_mask, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = 0},
+        };
+        const D3D12_BOX active{0, 0, 0, frame.width, frame.height, 1};
+
+        // R8_UINT and R8_UNORM share the R8 typeless family. The copied bytes
+        // become normalized visibility when the native shader samples the mask.
+        list->ResourceBarrier(2, to_copy);
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, &active);
+
+        const D3D12_RESOURCE_BARRIER from_copy[]{
+            transition(slot.output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, output_state),
+            transition(native_mask, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        };
+        list->ResourceBarrier(2, from_copy);
+    }
 
     list->EndQuery(impl.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i * 2 + 1);
     list->ResolveQueryData(impl.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, i * 2, 2,

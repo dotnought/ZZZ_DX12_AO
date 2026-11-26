@@ -69,6 +69,14 @@ public:
     HRESULT Record(ID3D12GraphicsCommandList *list, uint32_t slot, const Frame &frame,
                    const Settings &settings);
 
+    // Same queue/lifetime contract as Record. Overwrites a single-sample R8
+    // UNORM (or typeless R8) target matching the active extent. Record outside
+    // a render pass, after native mask production and before its consumers.
+    // The target starts and ends in RENDER_TARGET. Keep it alive through
+    // completion. GPU timing includes the copy into the game's mask.
+    HRESULT RecordToNativeMask(ID3D12GraphicsCommandList *list, uint32_t slot, const Frame &frame,
+                               const Settings &settings, ID3D12Resource *native_mask);
+
     // DXGI_FORMAT_R8_UINT (visibility / 255). The visible rect starts at (0,0)
     // and is frame.width by frame.height. The resource returns to output_state.
     static constexpr auto output_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -82,6 +90,8 @@ public:
 private:
     struct Impl;
     explicit XeGtaoDx12(std::unique_ptr<Impl> impl);
+    HRESULT RecordInternal(ID3D12GraphicsCommandList *list, uint32_t slot, const Frame &frame,
+                           const Settings &settings, ID3D12Resource *native_mask);
     std::unique_ptr<Impl> impl_;
 };
 
