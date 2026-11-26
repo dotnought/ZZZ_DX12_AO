@@ -1,6 +1,6 @@
 # ZZZ DX12 AO
 
-This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. The capture build leaves rendering unchanged. In-game AO activation depends on identifying and validating a ZZZ-specific render pass.
+This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. F10 records a read-only trace. The build also includes an opt-in mask override to test a candidate native pass in ZZZ 3.2. XeGTAO activation depends on confirming its inputs and composition point.
 
 ## Build on Windows 11
 
@@ -21,6 +21,14 @@ CMake downloads and verifies the pinned ReShade 6.7.3 source archive for its hea
 
 For a capture-only build, configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` and build `--target zzz_ao_capture`. This requires no DXC.
 
+## ZZZ 3.2 mask test
+
+The supplied traces at 3440×1440 with DLSS Performance show a 1720×720 scene viewport. They contain six scene recordings, two with Frame Generation on and four with it off. The other two observed presentations with Frame Generation on contain only a final image copy. This is consistent with generated presentations, but the trace does not tag them directly.
+
+All six scene recordings contain the same three consecutive pixel shaders producing two distinct 860×360 R8 resources and a 1720×720 R8 resource in that order. The final mask transitions to a readable state just before the suspected lighting shader `16383356142044416029`. A different compute shader also produces a half-resolution R8 candidate, so the visual role of the first chain still needs confirmation. Both traces show a copied 1720×720 typeless depth-stencil resource viewed as `R32_FLOAT_X8X24_TYPELESS`. Later, internal-size color, depth and two-channel textures are copied before the first 3440×1440 output draw. The exact DLSS evaluation call is outside the observed draw and dispatch events.
+
+To test the native mask, replace the old capture DLL with this build. In the same scene with DLSS Performance at 3440×1440, hold **F9** for a second and compare contact shading before, during and after the hold. The probe writes white after the matching native draw. If white makes no visible difference, hold **Shift+F9** once to try black. Release the keys to return to the native output. The override uses the three shader fingerprints, the expected viewports and single R8 targets, and a direct command list outside a render pass. The ReShade log records the first matching submission per hold. A brief description of what changed is enough for this test. If nothing changed, include whether the log reported an override.
+
 ## First in-game capture
 
 Use the documented add-on directory of your existing authorized, full-add-on ReShade setup. The add-on uses ReShade 6.7.3 headers (API 18). Check the host's log for `ZZZ AO DX12 diagnostics loaded` after startup. Keep the capture DLL out of the ReShade shader directory.
@@ -28,7 +36,7 @@ Use the documented add-on directory of your existing authorized, full-add-on ReS
 1. In DX12 gameplay, use 3440×1440, DLSS Performance and native Frame Generation on. Disable MXAO and its supporting ReShade effects for the capture. Choose a scene where a character is near floor or wall geometry.
 2. Tap **F10** with the game focused, then release it. The recorder collects the next four observed presentations on that swapchain. Confirm `ZZZ AO capture saved` in the ReShade log and find `zzz-ao-<pid>-<capture>.tsv` in `%TEMP%`.
 3. In that same scene and camera position, switch native Frame Generation off and capture once more with F10. Keep DLSS Performance enabled. Restore your settings afterwards.
-4. Return the two TSV files labeled by Frame Generation setting, the game build and ReShade versions, and the load/save lines from the ReShade log. If the add-on fails to load or save, the corresponding log lines are sufficient for diagnosing that failure.
+4. Send both TSV files and indicate which one used Frame Generation. Include the game or ReShade version only if it changed since the previous capture. If the add-on fails to load or save, send the corresponding ReShade log lines.
 
 If the capture shows several plausible scaling chains, the next comparison is a capture with super resolution off. Use the first two traces to decide whether that comparison is needed. This diagnostic build is for pass discovery. Benchmark without the capture add-on loaded because observing descriptor copies introduces CPU overhead.
 
@@ -50,7 +58,7 @@ The host must supply an SRV-compatible depth view and confirmed projection, choo
 
 A confirmed native ambient/indirect lighting consumer is the preferred AO composition point. If that path is inaccessible, validate an internal-resolution scene-color composition point before DLSS Super Resolution and HUD rendering. NVIDIA documents the separate scaling input, depth, motion vectors and HUD-less inputs, so the observer needs to establish how ZZZ uses them. HoYoverse documents the graphics settings without publishing the underlying resource bindings. [DLSS Super Resolution integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS.md) · [DLSS Frame Generation integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md) · [ZZZ PC visual experience FAQ](https://zenless.hoyoverse.com/en-us/news/165408?catchSpider=1&lang=en-us&page=news)
 
-Native AO enhancement is still unverified. For the alternative, XeGTAO's three-stage compute path, native-depth input, optional normals, compact visibility output and spatial denoiser are a good fit for internal-resolution AO feeding DLSS. CACAO offers adaptive and downsampled operation with additional pass/resource configurations. Both are MIT-licensed. The initial backend uses FP32 depth for the reconstructed-normal path. A measured FP16 path with confirmed native normals is a later optimization. The ReShade depth, frame-effect and shader replacement examples and RenoDX demonstrate relevant observation and in-frame add-on patterns. [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO) · [AMD CACAO](https://gpuopen.com/fidelityfx-cacao/) · [ReShade examples](https://github.com/crosire/reshade/tree/v6.7.3/examples) · [RenoDX](https://github.com/clshortfuse/renodx)
+The ZZZ 3.2 traces identify a native mask candidate. Its contribution to ambient lighting still needs the mask test above. For the alternative, XeGTAO's three-stage compute path, native-depth input, optional normals, compact visibility output and spatial denoiser are a good fit for internal-resolution AO feeding DLSS. CACAO offers adaptive and downsampled operation with additional pass/resource configurations. Both are MIT-licensed. The initial backend uses FP32 depth for the reconstructed-normal path. A measured FP16 path with confirmed native normals is a later optimization. The ReShade depth, frame-effect and shader replacement examples and RenoDX demonstrate relevant observation and in-frame add-on patterns. [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO) · [AMD CACAO](https://gpuopen.com/fidelityfx-cacao/) · [ReShade examples](https://github.com/crosire/reshade/tree/v6.7.3/examples) · [RenoDX](https://github.com/clshortfuse/renodx)
 
 The first composition build still needs game validation for HUD isolation, stable motion, Frame Generation parity, resize and alt-tab behavior, and scene transitions. In-game settings UI, debug visualization and AO resolution scaling are pending that integration. Measure AO plus composition GPU time, report median and 95th percentile, and compare frame time against the unmodified game and visually matched iMMERSE MXAO at the same settings. Treat 0.5, 1, 2 and 3 ms for Low through Ultra as targets for the RTX 4060 Ti.
 
