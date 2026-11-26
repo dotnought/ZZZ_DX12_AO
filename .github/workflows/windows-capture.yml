@@ -9,6 +9,7 @@ on:
       - src/capture.cpp
       - README.md
       - third_party/reshade/LICENSE.md
+      - third_party/imgui/LICENSE.txt
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,7 @@ jobs:
           Copy-Item build/Release/zzz_ao_capture.addon64 package/
           Copy-Item README.md package/
           Copy-Item third_party/reshade/LICENSE.md package/ReShade-LICENSE.md
+          Copy-Item third_party/imgui/LICENSE.txt package/Dear-ImGui-LICENSE.txt
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: zzz-ao-dx12-capture

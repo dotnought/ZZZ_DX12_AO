@@ -7,9 +7,9 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+include(FetchContent)
 set(RESHADE_INCLUDE_DIR "" CACHE PATH "Directory containing ReShade 6.7.3 reshade.hpp")
 if(NOT RESHADE_INCLUDE_DIR)
-    include(FetchContent)
     FetchContent_Declare(reshade
         URL https://codeload.github.com/crosire/reshade/tar.gz/4a50d1eddace85734871d91792ff214f13f66c01
         URL_HASH SHA256=a9353b0766274ab9fba1c8aa440d88ab8ec4ab2f363530b71ca4ccdd01a06e85
@@ -19,8 +19,19 @@ if(NOT RESHADE_INCLUDE_DIR)
     set(RESHADE_INCLUDE_DIR "${reshade_SOURCE_DIR}/include")
 endif()
 
+set(IMGUI_INCLUDE_DIR "" CACHE PATH "Directory containing Dear ImGui 1.92.5 imgui.h")
+if(NOT IMGUI_INCLUDE_DIR)
+    FetchContent_Declare(imgui
+        URL https://codeload.github.com/ocornut/imgui/tar.gz/3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c
+        URL_HASH SHA256=cd1cd7d279e568217e9caef0d49b2f199edc65cf0b9497712bc422cef5339bc0
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR unused)
+    FetchContent_MakeAvailable(imgui)
+    set(IMGUI_INCLUDE_DIR "${imgui_SOURCE_DIR}")
+endif()
+
 add_library(zzz_ao_capture MODULE src/capture.cpp)
-target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}")
+target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}" "${IMGUI_INCLUDE_DIR}")
 target_compile_definitions(zzz_ao_capture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(zzz_ao_capture PRIVATE user32)
 set_target_properties(zzz_ao_capture PROPERTIES

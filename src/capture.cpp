@@ -1,4 +1,5 @@
 #include <d3d12.h>
+#include <imgui.h>
 #include <reshade.hpp>
 
 #include <algorithm>
@@ -86,6 +87,14 @@ struct MaskProbe {
     std::unordered_map<a::command_list *, MaskList> lists;
 };
 
+struct Controls {
+    a::effect_runtime *runtime = nullptr;
+    bool mask_enabled = false;
+    bool black_mask = false;
+    bool capture_requested = false;
+    bool overlay_open = false;
+};
+
 struct HeapSlot {
     uint64_t heap = 0;
     uint32_t index = 0;
@@ -110,6 +119,7 @@ struct Capture {
 std::atomic_bool capturing{false};
 std::atomic_bool probing{false};
 MaskProbe mask_probe;
+Controls controls;
 std::mutex mutex;
 Capture capture;
 std::unordered_map<uint64_t, Texture> textures;
@@ -120,7 +130,6 @@ uint64_t next_texture_id = 0;
 uint32_t next_heap_id = 0;
 uint64_t next_capture_id = 0;
 bool descriptor_limit_reached = false;
-bool f10_down = false;
 
 template <typename... Args>
 std::string line(const char *kind, const Args &...args)
@@ -782,24 +791,66 @@ void save(Capture &finished)
         log::message(log::level::error, "ZZZ AO could not write the capture to the Windows temporary folder.");
 }
 
+void draw_settings(a::effect_runtime *runtime)
+{
+    if (!dx12(runtime->get_device()))
+        return;
+
+    const std::lock_guard lock(mutex);
+    if (controls.runtime != runtime)
+        controls = {runtime};
+    controls.overlay_open = true;
+
+    if (ImGui::Button(controls.mask_enabled ? "Disable mask test###mask_test"
+                                           : "Enable mask test###mask_test"))
+        controls.mask_enabled = !controls.mask_enabled;
+    if (controls.mask_enabled)
+        ImGui::Checkbox("Black mask", &controls.black_mask);
+
+    ImGui::BeginDisabled(controls.capture_requested || capture.swapchain != nullptr);
+    if (ImGui::Button(controls.capture_requested ? "Close overlay to capture###capture_trace"
+                                                 : "Capture DX12 trace###capture_trace"))
+        controls.capture_requested = true;
+    ImGui::EndDisabled();
+}
+
+bool overlay_state_changed(a::effect_runtime *runtime, bool open, a::input_source)
+{
+    const std::lock_guard lock(mutex);
+    if (controls.runtime == runtime)
+        controls.overlay_open = open;
+    return false;
+}
+
+void destroy_settings_runtime(a::effect_runtime *runtime)
+{
+    const std::lock_guard lock(mutex);
+    if (controls.runtime == runtime) {
+        controls = {};
+        probing.store(false, std::memory_order_relaxed);
+        mask_probe = {};
+    }
+}
+
 void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, const a::rect *,
              uint32_t, const a::rect *)
 {
     auto *device = queue->get_device();
     if (!dx12(device))
         return;
-    const bool down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
     const auto window = static_cast<HWND>(swapchain->get_hwnd());
     const bool focused = window && window == GetForegroundWindow();
-    const auto mode = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0
-        ? ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ? MaskOverride::black : MaskOverride::white)
-        : MaskOverride::off;
 
     Capture finished;
     bool probe_missed = false;
     {
         const std::lock_guard lock(mutex);
-        if ((focused || mask_probe.swapchain == swapchain) &&
+        const bool selected = focused && controls.runtime && controls.runtime->get_hwnd() == window &&
+                              controls.runtime->get_device() == device;
+        const auto mode = selected && controls.mask_enabled
+            ? (controls.black_mask ? MaskOverride::black : MaskOverride::white)
+            : MaskOverride::off;
+        if ((selected || mask_probe.swapchain == swapchain) &&
             (mask_probe.mode != mode || (mode != MaskOverride::off && mask_probe.swapchain != swapchain))) {
             probe_missed = mask_probe.mode != MaskOverride::off && !mask_probe.reported;
             mask_probe = {};
@@ -819,16 +870,15 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
                 finished = std::exchange(capture, Capture{});
             }
         }
-        if (focused) {
-            if (down && !f10_down && capture.device == nullptr && finished.id == 0) {
-                capture.swapchain = swapchain;
-                capture.device = device;
-                capture.id = ++next_capture_id;
-                append_trace(line("zzz_ao_capture", 1, interval_count));
-                append_trace(line("begin", emit_resource(device, swapchain->get_current_back_buffer())));
-                capturing.store(true, std::memory_order_relaxed);
-            }
-            f10_down = down;
+        if (selected && controls.capture_requested && !controls.overlay_open &&
+            capture.device == nullptr && finished.id == 0) {
+            controls.capture_requested = false;
+            capture.swapchain = swapchain;
+            capture.device = device;
+            capture.id = ++next_capture_id;
+            append_trace(line("zzz_ao_capture", 1, interval_count));
+            append_trace(line("begin", emit_resource(device, swapchain->get_current_back_buffer())));
+            capturing.store(true, std::memory_order_relaxed);
         }
     }
     if (probe_missed)
@@ -877,7 +927,7 @@ void observe()
 } // namespace
 
 extern "C" __declspec(dllexport) const char *NAME = "ZZZ DX12 AO Capture";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "F10 captures a DX12 trace. Hold F9 to test the ZZZ 3.2 lighting mask.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Capture a DX12 trace or test the ZZZ 3.2 lighting mask from the add-on panel.";
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {
@@ -915,7 +965,10 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
         observe<addon_event::execute_command_list, submit>();
         observe<addon_event::present, present>();
         observe<addon_event::destroy_swapchain, destroy_swapchain>();
-        reshade::log::message(reshade::log::level::info, "ZZZ AO DX12 diagnostics loaded. Press F10 for a trace or hold F9 for the ZZZ 3.2 mask test.");
+        observe<addon_event::destroy_effect_runtime, destroy_settings_runtime>();
+        observe<addon_event::reshade_open_overlay, overlay_state_changed>();
+        reshade::register_overlay(nullptr, guarded<draw_settings>(draw_settings));
+        reshade::log::message(reshade::log::level::info, "ZZZ AO DX12 diagnostics loaded. Controls are in the ReShade Add-ons panel.");
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
         reshade::unregister_addon(module);
     }

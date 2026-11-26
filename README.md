@@ -1,6 +1,6 @@
 # ZZZ DX12 AO
 
-This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. F10 records a read-only trace. The build also includes an opt-in mask override to test a candidate native pass in ZZZ 3.2. XeGTAO activation depends on confirming its inputs and composition point.
+This first milestone provides a Windows x64 ReShade add-on that captures ZZZ's DX12 pass and resource metadata, plus a native D3D12 XeGTAO backend. The ReShade add-on panel can record a read-only trace. The build also includes an opt-in mask override to test a candidate native pass in ZZZ 3.2. XeGTAO activation depends on confirming its inputs and composition point.
 
 ## Build on Windows 11
 
@@ -11,7 +11,7 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
-CMake downloads and verifies the pinned ReShade 6.7.3 source archive for its headers. An offline build can pass `-DRESHADE_INCLUDE_DIR=C:/path/to/reshade/include` with the same revision. If DXC discovery fails, pass `-DDXC_EXECUTABLE="<full path to the SDK's x64 dxc.exe>"` at configure time.
+CMake downloads and verifies the pinned ReShade 6.7.3 and Dear ImGui 1.92.5 archives for their headers. An offline build can pass `-DRESHADE_INCLUDE_DIR=C:/path/to/reshade/include` and `-DIMGUI_INCLUDE_DIR=C:/path/to/imgui` with the same revisions. If DXC discovery fails, pass `-DDXC_EXECUTABLE="<full path to the SDK's x64 dxc.exe>"` at configure time.
 
 | Output | Path |
 | --- | --- |
@@ -27,15 +27,15 @@ The supplied traces at 3440×1440 with DLSS Performance show a 1720×720 scene v
 
 All six scene recordings contain the same three consecutive pixel shaders producing two distinct 860×360 R8 resources and a 1720×720 R8 resource in that order. The final mask transitions to a readable state just before the suspected lighting shader `16383356142044416029`. A different compute shader also produces a half-resolution R8 candidate, so the visual role of the first chain still needs confirmation. Both traces show a copied 1720×720 typeless depth-stencil resource viewed as `R32_FLOAT_X8X24_TYPELESS`. Later, internal-size color, depth and two-channel textures are copied before the first 3440×1440 output draw. The exact DLSS evaluation call is outside the observed draw and dispatch events.
 
-To test the native mask, replace the old capture DLL with this build. In the same scene with DLSS Performance at 3440×1440, hold **F9** for a second and compare contact shading before, during and after the hold. The probe writes white after the matching native draw. If white makes no visible difference, hold **Shift+F9** once to try black. Release the keys to return to the native output. The override uses the three shader fingerprints, the expected viewports and single R8 targets, and a direct command list outside a render pass. The ReShade log records the first matching submission per hold. A brief description of what changed is enough for this test. If nothing changed, include whether the log reported an override.
+To test the native mask, replace the old capture DLL with this build. In the same scene with DLSS Performance at 3440×1440, open the ReShade overlay and go to **Add-ons → ZZZ DX12 AO Capture**. Click **Enable mask test**, then compare the contact shading in the game. The probe writes white after the matching native draw. If you see no change, select **Black mask** in the panel and check again. Use **Disable mask test** to restore the native output. The ReShade log records the first matching submission for each setting. A brief description of what changed is enough for this test. If nothing changed, include whether the log reported an override.
 
 ## First in-game capture
 
 Use the documented add-on directory of your existing authorized, full-add-on ReShade setup. The add-on uses ReShade 6.7.3 headers (API 18). Check the host's log for `ZZZ AO DX12 diagnostics loaded` after startup. Keep the capture DLL out of the ReShade shader directory.
 
 1. In DX12 gameplay, use 3440×1440, DLSS Performance and native Frame Generation on. Disable MXAO and its supporting ReShade effects for the capture. Choose a scene where a character is near floor or wall geometry.
-2. Tap **F10** with the game focused, then release it. The recorder collects the next four observed presentations on that swapchain. Confirm `ZZZ AO capture saved` in the ReShade log and find `zzz-ao-<pid>-<capture>.tsv` in `%TEMP%`.
-3. In that same scene and camera position, switch native Frame Generation off and capture once more with F10. Keep DLSS Performance enabled. Restore your settings afterwards.
+2. Click **Capture DX12 trace** in **Add-ons → ZZZ DX12 AO Capture**, then close the overlay. The recorder collects the next four observed presentations on that swapchain. Confirm `ZZZ AO capture saved` in the ReShade log and find `zzz-ao-<pid>-<capture>.tsv` in `%TEMP%`.
+3. In that same scene and camera position, switch native Frame Generation off and click **Capture DX12 trace** again. Keep DLSS Performance enabled. Restore your settings afterwards.
 4. Send both TSV files and indicate which one used Frame Generation. Include the game or ReShade version only if it changed since the previous capture. If the add-on fails to load or save, send the corresponding ReShade log lines.
 
 If the capture shows several plausible scaling chains, the next comparison is a capture with super resolution off. Use the first two traces to decide whether that comparison is needed. This diagnostic build is for pass discovery. Benchmark without the capture add-on loaded because observing descriptor copies introduces CPU overhead.
@@ -67,8 +67,9 @@ The first composition build still needs game validation for HUD isolation, stabl
 | Dependency | Use and license |
 | --- | --- |
 | [ReShade v6.7.3](https://github.com/crosire/reshade/tree/4a50d1eddace85734871d91792ff214f13f66c01) | Add-on headers and compatible host. The project license is BSD 3-Clause, and the used headers declare BSD 3-Clause or MIT. See [license notice](third_party/reshade/LICENSE.md). |
+| [Dear ImGui 1.92.5](https://github.com/ocornut/imgui/tree/3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c) | MIT. The add-on uses headers for ReShade's overlay API. See [license notice](third_party/imgui/LICENSE.txt). |
 | [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO/tree/a5b1686c7ea37788eeb3576b5be47f7c03db532c) | MIT. The two shader headers are vendored under [their license](third_party/xegtao/LICENSE). The source change adds an opt-in final visibility adjustment in the denoiser. |
 | [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) | Build tool from the Windows SDK, NCSA license. DXC binaries are supplied by the installed SDK. |
 | [Windows SDK and D3D12](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) | Visual Studio/Windows SDK installation and system Direct3D 12 runtime under Microsoft's terms. |
 
-CACAO, RenoDX, NVIDIA Streamline and the game are references for this milestone. The build fetches only the ReShade headers dependency and ships no game or NVIDIA binaries.
+CACAO, RenoDX, NVIDIA Streamline and the game are references for this milestone. The build fetches only the ReShade and Dear ImGui header dependencies and ships no game or NVIDIA binaries.
