@@ -96,6 +96,9 @@ float OcclusionDisk(int2 pixel, int2 limit, float2 texelSize, float center, floa
     [loop]
     for (int y = -radius; y < radius; y += 2)
     {
+        float2 rowOcclusion = 0.0;
+        float2 rowKnownWeight = 0.0;
+        float2 rowWeight = 0.0;
         [loop]
         for (int x = -radius; x < radius; x += 2)
         {
@@ -117,8 +120,18 @@ float OcclusionDisk(int2 pixel, int2 limit, float2 texelSize, float center, floa
             const float4 range = 1.0 - smoothstep(0.015, 0.05, max(abs(dz), obstruction));
             const float4 valid = float4(abs(pixel.x + dx - halfExtent.x) <= halfExtent.x)
                                * float4(abs(pixel.y + dy - halfExtent.y) <= halfExtent.y);
-            occlusion += dot(falloff * falloff * valid, angle * shallow * range);
+            const float4 spatial = falloff * falloff * valid;
+            const float4 known = spatial * (1.0 - smoothstep(0.05, 0.075, abs(dz)));
+            const float4 blocked = spatial * angle * shallow * range;
+            rowOcclusion += blocked.xz + blocked.yw;
+            rowKnownWeight += known.xz + known.yw;
+            rowWeight += spatial.xz + spatial.yw;
         }
+        // A detached foreground surface hides the depth behind it. Estimate
+        // that contribution from the visible portion of the same rows so the
+        // silhouette doesn't punch a bright wedge into an existing shadow.
+        const float2 coverage = max(rowKnownWeight, 0.4 * rowWeight);
+        occlusion += dot(rowOcclusion, rowWeight / max(coverage, 1e-6));
     }
     return 1.0 - 0.57 * occlusion / diskWeight;
 }
