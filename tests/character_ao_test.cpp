@@ -234,9 +234,15 @@ int main()
         return 1;
     const D3D12_RECT crease{contact_edge, 0, 224, 64};
     const D3D12_RECT silhouette{contact_edge, 64, 224, 128};
+    constexpr UINT layer_left = 68;
+    constexpr UINT layer_right = 73;
+    const D3D12_RECT narrow_overlay{layer_left, 0, layer_right, 64};
+    const D3D12_RECT shallow_overlay{layer_left, 64, layer_right, 128};
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.253f, 0, 1, &crease);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.7f, 0, 1, &silhouette);
+    list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.253f, 0, 1, &narrow_overlay);
+    list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.2514f, 0, 1, &shallow_overlay);
     for (LONG x = 0; x < static_cast<LONG>(extent); ++x) {
         const D3D12_RECT column{x, 128, x + 1, 192};
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.18f + 0.0012f * x, 0, 1, &column);
@@ -312,6 +318,21 @@ int main()
     falls_off &= shade_levels >= 8 && pixel(contact_edge - 12, profile_y)[0] < flat_color &&
                  pixel(contact_edge - 1, profile_y)[0] < 175;
 
+    // A narrow layer should cast a single shadow on each side. A shallow
+    // step must not bend the form shading of the layer's planar surface.
+    const int preview_flat = pixel(24, profile_y, stride)[0];
+    bool clean_overlay = true;
+    for (UINT distance = 1; distance < 17; ++distance) {
+        const UINT left = layer_left - distance;
+        const UINT right = layer_right - 1 + distance;
+        const int left_drop = int(pixel(left - 1, profile_y, stride)[0]) - pixel(left, profile_y, stride)[0];
+        const int right_drop = int(pixel(right + 1, profile_y, stride)[0]) - pixel(right, profile_y, stride)[0];
+        clean_overlay &= left_drop >= -1 && left_drop <= 14 && right_drop >= -1 && right_drop <= 14;
+    }
+    clean_overlay &= pixel(layer_left - 1, profile_y, stride)[0] <= preview_flat - 25;
+    for (UINT x = layer_left; x < layer_right; ++x)
+        clean_overlay &= std::abs(int(pixel(x, 96, stride)[0]) - preview_flat) <= 2;
+
     bool neutral = flat_color >= 190 && pixel(contact_edge, profile_y)[0] == flat_color;
     const int tilted_color = pixel(contact_edge, 160)[0];
     for (UINT x = contact_edge - 25; x <= contact_edge + 25; ++x) {
@@ -365,13 +386,15 @@ int main()
     readback->Unmap(0, &written);
     if (!neutral)
         std::cerr << "Occlusion leaked across a silhouette or shading varied along a plane.\n";
+    if (!clean_overlay)
+        std::cerr << "A narrow or shallow overlay produced a second contour.\n";
     if (!form_shading)
         std::cerr << "The sphere did not have a gradual directional shading profile.\n";
     if (!matches_preview)
         std::cerr << "Grayscale preview disagreed with the shading applied to scene color.\n";
     if (!blend_and_restore)
         std::cerr << "Unexpected scene-color alpha or restored draw.\n";
-    if (!falls_off || !neutral || !form_shading || !cylinder_smooth || !matches_preview || !blend_and_restore)
+    if (!falls_off || !clean_overlay || !neutral || !form_shading || !cylinder_smooth || !matches_preview || !blend_and_restore)
         return 1;
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info))) {

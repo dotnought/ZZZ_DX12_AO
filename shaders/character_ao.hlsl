@@ -1,25 +1,4 @@
 Texture2D<float> SceneDepth : register(t0);
-SamplerState DepthClamp : register(s0);
-
-// Each entry contributes at both signs of its offset. The staggered radii
-// cover the near contacts and the wider fade without distinct sampling rings.
-// The last two columns scale the angular response and the radial falloff.
-static const float4 Taps[] = {
-    float4( -0.131,   1.695, 257.5, 0.818),
-    float4( -1.850,  -1.606, 234.0, 0.783),
-    float4(  3.329,  -0.690, 209.7, 0.739),
-    float4( -3.675,   2.328, 190.0, 0.695),
-    float4(  0.737,  -5.652, 167.7, 0.635),
-    float4(  1.385,   6.913, 150.0, 0.575),
-    float4( -6.058,  -6.034, 134.3, 0.511),
-    float4( 10.050,   1.742, 120.4, 0.442),
-    float4( -9.319,   7.560, 108.2, 0.370),
-    float4( -3.545, -13.699,  96.5, 0.288),
-    float4( 15.886,  -4.458,  86.4, 0.205),
-    float4(-19.045,   1.453,  77.3, 0.120),
-    float4( -6.199, -20.691,  70.3, 0.050),
-};
-
 float LoadDepth(int2 pixel, int2 limit)
 {
     return SceneDepth.Load(int3(clamp(pixel, int2(0, 0), limit), 0));
@@ -35,21 +14,27 @@ float SurfaceSlope(int2 pixel, int2 axis, int2 limit, float center)
         return forward;
     if (any(high > limit))
         return backward;
+    // A feature only one pixel wide has no reliable tangent across its edges.
+    if (backward * forward < 0.0 && min(abs(backward), abs(forward)) > 0.0052 * center)
+        return 0.0;
     return abs(backward) < abs(forward) ? backward : forward;
 }
 
 float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter, float2 localSlope)
 {
-    float2 sum = 0.4 * localSlope;
-    float2 totalWeight = 0.4;
-    static const float3 scaleWeights = float3(0.6, 1.0, 0.65);
+    float2 sum = 0.32 * localSlope;
+    float2 totalWeight = 0.32;
+    static const float scaleWeights[] = {0.22, 0.5, 0.8, 1.0, 1.0, 0.85, 0.6, 0.35};
+    float4 connected = 1.0;
+    float4 lastDepth = 0.0;
+    float4 lastStep = float4(-1, 1, -1, 1) * localSlope.x
+                    + float4(-1, -1, 1, 1) * localSlope.y;
 
-    // Average centered slopes across neighboring rows and columns. A facet
-    // crossing then contributes gradually as it moves through the footprint.
-    [unroll]
-    for (int i = 0; i < 3; ++i)
+    // Check every texel along the four diagonals. A wide sample cannot
+    // contribute if a closer sample crossed an edge on the same path.
+    [loop]
+    for (int radius = 1; radius <= 8; ++radius)
     {
-        const int radius = 2 + 3 * i;
         const int2 low = pixel - radius;
         const int2 high = pixel + radius;
         const float4 valid = float4(
@@ -59,11 +44,12 @@ float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter
             LoadDepth(low, limit), LoadDepth(int2(high.x, low.y), limit),
             LoadDepth(int2(low.x, high.y), limit), LoadDepth(high, limit));
         const float4 delta = (depth - center) * inverseCenter;
-        const float4 tangent = radius * (float4(-1, 1, -1, 1) * localSlope.x
-                                       + float4(-1, -1, 1, 1) * localSlope.y);
-        const float4 confidence = valid * scaleWeights[i]
-            * (1.0 - smoothstep(0.0035, 0.012, abs(delta - tangent)))
+        const float4 step = delta - lastDepth;
+        connected = min(connected, valid * (1.0 - smoothstep(0.0017, 0.0052, abs(step - lastStep))));
+        const float4 confidence = connected * scaleWeights[radius - 1]
             * (1.0 - smoothstep(0.028, 0.085, abs(delta)));
+        lastDepth = delta;
+        lastStep = step;
 
         // Both ends must belong to the receiving surface. The local slope
         // remains available for thin geometry with no reliable wide pair.
@@ -91,27 +77,34 @@ float FormLighting(int2 pixel, int2 limit, float2 dimensions, float center, floa
     return lerp(0.68, 1.0, smoothstep(-0.36, 0.94, dot(normal, key)));
 }
 
-float SampleOcclusion(float2 location, float2 pixel, float2 limit, float2 texelSize,
-                      float center, float inverseCenter, float2 slope, float angleScale)
+float OcclusionAlong(int2 pixel, int2 limit, float center, float inverseCenter, float2 slope, int2 axis)
 {
-    const float4 depths = SceneDepth.GatherRed(DepthClamp, (location + 0.5) * texelSize);
-    const float2 corner = floor(location);
-    const float2 fraction = location - corner;
-    const float4 weights = float4(
-        (1.0 - fraction.x) * fraction.y, fraction.x * fraction.y,
-        fraction.x * (1.0 - fraction.y), (1.0 - fraction.x) * (1.0 - fraction.y));
+    const bool diagonal = axis.x != 0 && axis.y != 0;
+    const float pixelDistance = diagonal ? 1.41421356 : 1.0;
+    const int steps = diagonal ? 11 : 15;
+    const float axisSlope = dot(slope, float2(axis));
+    float2 horizon = 0.0;
 
-    // Gather returns bottom-left, bottom-right, top-right, then top-left.
-    const float4 x = clamp(corner.x + float4(0, 1, 1, 0), 0.0, limit.x) - pixel.x;
-    const float4 y = clamp(corner.y + float4(1, 1, 0, 0), 0.0, limit.y) - pixel.y;
-    const float4 relativeDepth = (depths - center) * inverseCenter;
-    const float4 obstruction = relativeDepth - (x * slope.x + y * slope.y);
-    const float4 contact = smoothstep(0.0, 1.0, (obstruction - 0.00065) * angleScale);
-    const float4 range = 1.0 - smoothstep(0.028, 0.074, max(abs(relativeDepth), obstruction));
-
-    // Interpolate the occlusion contributions after depth rejection. Filtering
-    // depth first would invent blockers in the gap at a character silhouette.
-    return dot(weights, contact * range);
+    // Scan both sides without gaps, so a narrow blocker fades with distance
+    // instead of dropping out and reappearing at different tap radii.
+    [loop]
+    for (int i = 1; i <= steps; ++i)
+    {
+        const int2 offset = i * axis;
+        const int2 high = pixel + offset;
+        const int2 low = pixel - offset;
+        const float2 valid = float2(all(high >= 0) && all(high <= limit),
+                                    all(low >= 0) && all(low <= limit));
+        const float2 relativeDepth = (float2(LoadDepth(high, limit), LoadDepth(low, limit)) - center) * inverseCenter;
+        const float2 obstruction = relativeDepth - float2(i, -i) * axisSlope;
+        const float distance = pixelDistance * i;
+        const float2 angle = smoothstep(0.0, 0.003 + 0.00052 * distance, obstruction - 0.00065);
+        const float2 shallow = smoothstep(0.001, 0.009, obstruction);
+        const float2 range = 1.0 - smoothstep(0.028, 0.074, max(abs(relativeDepth), obstruction));
+        const float falloff = 1.0 - smoothstep(0.0, 16.0, distance);
+        horizon = max(horizon, valid * angle * shallow * range * falloff);
+    }
+    return horizon.x + horizon.y;
 }
 
 float SceneShading(float2 uv, float background)
@@ -134,22 +127,12 @@ float SceneShading(float2 uv, float background)
         SurfaceSlope(pixel, int2(1, 0), limit, center),
         SurfaceSlope(pixel, int2(0, 1), limit, center)
     ) * inverseCenter;
-    const float2 texelSize = rcp(dimensions);
-
+    static const int2 axes[] = {int2(1, 0), int2(0, 1), int2(1, 1), int2(-1, 1)};
     float occlusion = 0.0;
-    float weight = 0.0;
-    [loop]
-    for (uint i = 0; i < sizeof(Taps) / sizeof(Taps[0]); ++i)
-    {
-        const float4 tap = Taps[i];
-        const float forward = SampleOcclusion(pixel + tap.xy, pixel, limit, texelSize,
-                                              center, inverseCenter, slope, tap.z);
-        const float backward = SampleOcclusion(pixel - tap.xy, pixel, limit, texelSize,
-                                               center, inverseCenter, slope, tap.z);
-        occlusion += (forward + backward) * tap.w;
-        weight += tap.w;
-    }
-    const float visibility = 1.0 - 0.27 * (occlusion / weight);
+    [unroll]
+    for (uint i = 0; i < sizeof(axes) / sizeof(axes[0]); ++i)
+        occlusion += OcclusionAlong(pixel, limit, center, inverseCenter, slope, axes[i]);
+    const float visibility = 1.0 - 0.52 * (occlusion / 8.0);
     return visibility * FormLighting(pixel, limit, dimensions, center, inverseCenter, slope);
 }
 
