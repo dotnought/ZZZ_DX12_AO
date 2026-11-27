@@ -31,16 +31,22 @@ if(NOT IMGUI_INCLUDE_DIR)
 endif()
 
 find_program(DXC_EXECUTABLE NAMES dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
-set(character_ao_header "${CMAKE_CURRENT_BINARY_DIR}/generated/character_ao_ps.hpp")
-add_custom_command(OUTPUT "${character_ao_header}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E CharacterVisibility -O3 -Ges -WX
-        -Fo "${CMAKE_CURRENT_BINARY_DIR}/generated/character_ao_ps.dxil"
-        -Fh "${character_ao_header}" -Vn character_ao_ps_bytecode
-        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/character_ao.hlsl"
-    DEPENDS shaders/character_ao.hlsl
-    VERBATIM)
-add_custom_target(zzz_ao_character_shader DEPENDS "${character_ao_header}")
+function(embed_shader source profile entry name headers)
+    set(stem "${CMAKE_CURRENT_BINARY_DIR}/generated/${name}")
+    add_custom_command(OUTPUT "${stem}.hpp"
+        BYPRODUCTS "${stem}.dxil"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${DXC_EXECUTABLE}" -T "${profile}" -E "${entry}" -O3 -Ges -WX
+            -Fo "${stem}.dxil" -Fh "${stem}.hpp" -Vn "${name}_bytecode"
+            "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+        DEPENDS "${source}"
+        VERBATIM)
+    set(${headers} ${${headers}} "${stem}.hpp" PARENT_SCOPE)
+endfunction()
+
+embed_shader(shaders/character_ao.hlsl ps_6_0 CharacterVisibility character_ao_ps character_ao_headers)
+embed_shader(shaders/character_ao.hlsl ps_6_0 ShadingView shading_view_ps character_ao_headers)
+add_custom_target(zzz_ao_character_shader DEPENDS ${character_ao_headers})
 option(ZZZ_AO_ENABLE_TRACE "Enable the optional DX12 trace in the add-on panel" OFF)
 add_library(zzz_ao_capture MODULE src/capture.cpp src/character_ao.cpp)
 add_dependencies(zzz_ao_capture zzz_ao_character_shader)
@@ -66,24 +72,9 @@ if(ZZZ_AO_TEST_DEPTH_CAPTURE)
     add_test(NAME depth_capture COMMAND zzz_ao_depth_capture_test)
     set_tests_properties(depth_capture PROPERTIES SKIP_RETURN_CODE 77)
 
-    set(scene_test_headers)
-    foreach(stage IN ITEMS vs ps)
-        if(stage STREQUAL "vs")
-            set(entry SceneVertex)
-        else()
-            set(entry SceneColor)
-        endif()
-        set(header "${CMAKE_CURRENT_BINARY_DIR}/generated/character_scene_${stage}.hpp")
-        list(APPEND scene_test_headers "${header}")
-        add_custom_command(OUTPUT "${header}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-            COMMAND "${DXC_EXECUTABLE}" -T "${stage}_6_0" -E "${entry}" -O3 -Ges -WX
-                -Fo "${CMAKE_CURRENT_BINARY_DIR}/generated/character_scene_${stage}.dxil"
-                -Fh "${header}" -Vn "character_scene_${stage}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/character_scene.hlsl"
-            DEPENDS tests/character_scene.hlsl
-            VERBATIM)
-    endforeach()
+    embed_shader(tests/character_scene.hlsl vs_6_0 SceneVertex character_scene_vs scene_test_headers)
+    embed_shader(tests/character_scene.hlsl ps_6_0 SceneColor character_scene_ps scene_test_headers)
+    embed_shader(tests/character_scene.hlsl ps_6_0 SphereDepth sphere_depth_ps scene_test_headers)
     add_executable(zzz_ao_character_test tests/character_ao_test.cpp src/character_ao.cpp ${scene_test_headers})
     add_dependencies(zzz_ao_character_test zzz_ao_character_shader)
     target_include_directories(zzz_ao_character_test PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")

@@ -4,6 +4,7 @@
 
 #include "character_ao.hpp"
 #include "character_ao_ps.hpp"
+#include "shading_view_ps.hpp"
 #ifdef ZZZ_AO_ENABLE_TRACE
 #include "depth_capture.hpp"
 #endif
@@ -27,6 +28,7 @@
 namespace {
 using namespace reshade;
 namespace a = reshade::api;
+using zzz_ao::ShadingPass;
 
 #ifdef ZZZ_AO_ENABLE_TRACE
 constexpr unsigned interval_count = 4;
@@ -142,12 +144,14 @@ struct AoRuntime {
     a::swapchain *swapchain = nullptr;
     HWND window = nullptr;
     bool reported = false;
+    ShadingPass pass = ShadingPass::composite;
     std::unordered_map<a::command_list *, AoList> lists;
 };
 
 struct Controls {
     a::effect_runtime *runtime = nullptr;
     bool detail_ao = false;
+    bool shading_view = false;
 #ifdef ZZZ_AO_ENABLE_TRACE
     bool capture_requested = false;
     bool overlay_open = false;
@@ -378,28 +382,34 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
                 if (objects[i].type != a::pipeline_subobject_type::blend_state)
                     replacement.push_back(objects[i]);
             }
-            a::shader_desc visibility = *pixel_shader;
-            visibility.code = character_ao_ps_bytecode;
-            visibility.code_size = sizeof(character_ao_ps_bytecode);
+            a::shader_desc shading = *pixel_shader;
             const auto shader = std::ranges::find(replacement, a::pipeline_subobject_type::pixel_shader,
                                                    &a::pipeline_subobject::type);
-            shader->data = &visibility;
+            shader->data = &shading;
             a::blend_desc blend;
-            blend.blend_enable[0] = true;
-            blend.source_color_blend_factor[0] = a::blend_factor::zero;
-            blend.dest_color_blend_factor[0] = a::blend_factor::source_color;
             blend.render_target_write_mask[0] = 0x7;
             replacement.push_back({a::pipeline_subobject_type::blend_state, 1, &blend});
-            a::pipeline variant{};
+
             const a::pipeline_layout character_root{reinterpret_cast<uint64_t>(ao.Root())};
-            if (device->create_pipeline(character_root, static_cast<uint32_t>(replacement.size()),
-                                        replacement.data(), &variant)) {
-                ao.Attach(reinterpret_cast<ID3D12PipelineState *>(variant.handle));
-                info.character_ao = std::move(ao);
-            }
+            const auto create_pass = [&](ShadingPass pass, const auto &bytecode) {
+                shading.code = bytecode;
+                shading.code_size = sizeof(bytecode);
+                blend.blend_enable[0] = pass == ShadingPass::composite;
+                blend.source_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::zero : a::blend_factor::one;
+                blend.dest_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::source_color : a::blend_factor::zero;
+                a::pipeline variant{};
+                if (device->create_pipeline(character_root, static_cast<uint32_t>(replacement.size()),
+                                            replacement.data(), &variant))
+                    ao.Attach(pass, reinterpret_cast<ID3D12PipelineState *>(variant.handle));
+            };
+            create_pass(ShadingPass::composite, character_ao_ps_bytecode);
+            create_pass(ShadingPass::preview, shading_view_ps_bytecode);
+            info.character_ao = std::move(ao);
         }
-        if (!info.character_ao)
-            log::message(log::level::warning, "ZZZ AO could not create the character detail AO pipeline.");
+        if (!info.character_ao.HasPipeline(ShadingPass::composite))
+            log::message(log::level::warning, "ZZZ AO could not create the Detail AO pipeline.");
+        if (!info.character_ao.HasPipeline(ShadingPass::preview))
+            log::message(log::level::warning, "ZZZ AO could not create the Shading View pipeline.");
     }
 
     const std::lock_guard lock(mutex);
@@ -874,6 +884,7 @@ bool copy_texture(a::command_list *cmd, a::resource source, uint32_t source_subr
 struct AoDraw {
     a::pipeline original{};
     zzz_ao::CharacterAo character;
+    ShadingPass pass = ShadingPass::composite;
     a::pipeline_layout layout{};
     D3D12_GPU_DESCRIPTOR_HANDLE depth{};
     std::array<D3D12_GPU_DESCRIPTOR_HANDLE, 3> tables{};
@@ -934,7 +945,9 @@ void prepare_character_draw(a::device *device, const AoList &list, AoDraw &actio
         return;
 
     const auto pipeline = pipelines.find(list.pipeline.handle);
-    if (pipeline == pipelines.end() || !pipeline->second.character_ao || pipeline->second.layout != list.graphics_layout ||
+    const auto pass = ao_runtime.pass;
+    if (pipeline == pipelines.end() || !pipeline->second.character_ao.HasPipeline(pass) ||
+        pipeline->second.layout != list.graphics_layout ||
         !prescale_layout_can_restore(list.graphics_layout))
         return;
     const auto &desc = texture(device, list.target_resource).desc;
@@ -951,6 +964,7 @@ void prepare_character_draw(a::device *device, const AoList &list, AoDraw &actio
         return;
     action.original = list.pipeline;
     action.character = pipeline->second.character_ao;
+    action.pass = pass;
     action.layout = {list.graphics_layout};
     action.depth = {inputs.depth_srv.handle};
     for (size_t i = 0; i < action.tables.size(); ++i)
@@ -1000,7 +1014,7 @@ AoDraw observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t elem
             list.pixel_shader != prescale_scene_shader || GetForegroundWindow() != ao_runtime.window)
             return;
         prepare_character_draw(cmd->get_device(), list, action);
-        list.modified = static_cast<bool>(action.character);
+        list.modified = action.original.handle != 0;
     });
     return action;
 }
@@ -1008,13 +1022,13 @@ AoDraw observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t elem
 template <typename Draw>
 bool apply_ao(a::command_list *cmd, const AoDraw &action, const Draw &execute_draw)
 {
-    if (!action.character)
+    if (!action.original.handle)
         return false;
 
-    // Reissue the matched native draw, then draw visibility and restore its state.
+    // Reissue the matched native draw, then draw shading and restore its state.
     execute_draw();
     auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
-    action.character.Bind(list, action.tables[0], action.depth);
+    action.character.Bind(action.pass, list, action.tables[0], action.depth);
     execute_draw();
     zzz_ao::CharacterAo::Restore(list, reinterpret_cast<ID3D12PipelineState *>(action.original.handle),
                                 reinterpret_cast<ID3D12RootSignature *>(action.layout.handle), action.tables);
@@ -1250,6 +1264,9 @@ void draw_settings(a::effect_runtime *runtime)
     if (controls.runtime != runtime)
         controls = {runtime};
     ImGui::Checkbox("Detail AO", &controls.detail_ao);
+    ImGui::BeginDisabled(!controls.detail_ao);
+    ImGui::Checkbox("Shading View", &controls.shading_view);
+    ImGui::EndDisabled();
 
 #ifdef ZZZ_AO_ENABLE_TRACE
     controls.overlay_open = true;
@@ -1325,6 +1342,8 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
             ao_runtime = {};
             ao_active.store(false, std::memory_order_relaxed);
         }
+        if (enabled)
+            ao_runtime.pass = controls.shading_view ? ShadingPass::preview : ShadingPass::composite;
 #ifdef ZZZ_AO_ENABLE_TRACE
         if (capture.swapchain == swapchain) {
             ++capture.presents;
@@ -1413,7 +1432,7 @@ void observe()
 } // namespace
 
 extern "C" __declspec(dllexport) const char *NAME = "ZZZ DX12 AO";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Native detail ambient occlusion before DLSS in ZZZ 3.2.";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Native form shading and ambient occlusion before DLSS in ZZZ 3.2.";
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {

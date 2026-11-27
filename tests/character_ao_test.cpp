@@ -2,19 +2,23 @@
 #include "character_ao_ps.hpp"
 #include "character_scene_ps.hpp"
 #include "character_scene_vs.hpp"
+#include "shading_view_ps.hpp"
+#include "sphere_depth_ps.hpp"
 
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 
 using Microsoft::WRL::ComPtr;
+using zzz_ao::ShadingPass;
 
 namespace {
 
-constexpr UINT extent = 192;
+constexpr UINT extent = 256;
 constexpr UINT contact_edge = extent / 2;
 constexpr DXGI_FORMAT color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr D3D12_RESOURCE_DESC color_desc{
@@ -79,32 +83,50 @@ ComPtr<ID3D12RootSignature> OriginalRoot(ID3D12Device *device)
     return result;
 }
 
-ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignature *root, bool composite)
+enum class TestPass { game, composite, preview, depth };
+
+ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignature *root, TestPass pass)
 {
+    const bool composite = pass == TestPass::composite;
+    const bool depth_only = pass == TestPass::depth;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root;
-    desc.VS = {character_scene_vs, sizeof(character_scene_vs)};
-    desc.PS = composite ? D3D12_SHADER_BYTECODE{character_ao_ps_bytecode, sizeof(character_ao_ps_bytecode)}
-                        : D3D12_SHADER_BYTECODE{character_scene_ps, sizeof(character_scene_ps)};
+    desc.VS = {character_scene_vs_bytecode, sizeof(character_scene_vs_bytecode)};
+    switch (pass) {
+    case TestPass::game:
+        desc.PS = {character_scene_ps_bytecode, sizeof(character_scene_ps_bytecode)};
+        break;
+    case TestPass::composite:
+        desc.PS = {character_ao_ps_bytecode, sizeof(character_ao_ps_bytecode)};
+        break;
+    case TestPass::preview:
+        desc.PS = {shading_view_ps_bytecode, sizeof(shading_view_ps_bytecode)};
+        break;
+    case TestPass::depth:
+        desc.PS = {sphere_depth_ps_bytecode, sizeof(sphere_depth_ps_bytecode)};
+        break;
+    }
     desc.BlendState.RenderTarget[0] = {composite, FALSE, composite ? D3D12_BLEND_ZERO : D3D12_BLEND_ONE,
         composite ? D3D12_BLEND_SRC_COLOR : D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
         D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
-        static_cast<UINT8>(composite ? 0x7 : 0xf)};
+        static_cast<UINT8>(pass == TestPass::game ? 0xf : 0x7)};
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthEnable = depth_only;
+    desc.DepthStencilState.DepthWriteMask = depth_only ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     desc.DepthStencilState.FrontFace = desc.DepthStencilState.BackFace = {
         D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS
     };
     desc.SampleMask = UINT_MAX;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = color_format;
+    desc.NumRenderTargets = depth_only ? 0 : 1;
+    desc.RTVFormats[0] = depth_only ? DXGI_FORMAT_UNKNOWN : color_format;
+    desc.DSVFormat = depth_only ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_UNKNOWN;
     desc.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
-    Check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)),
-          composite ? "Create composite pipeline" : "Create native pipeline");
+    Check(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)), "Create test pipeline");
     return pso;
 }
 
@@ -129,9 +151,11 @@ int main()
         std::cerr << "Could not create the test root signatures.\n";
         return 1;
     }
-    auto native = MakePipeline(device.Get(), native_root.Get(), false);
-    ao.Attach(MakePipeline(device.Get(), ao.Root(), true).Detach());
-    if (!native || !ao)
+    auto native = MakePipeline(device.Get(), native_root.Get(), TestPass::game);
+    auto sphere = MakePipeline(device.Get(), native_root.Get(), TestPass::depth);
+    ao.Attach(ShadingPass::composite, MakePipeline(device.Get(), ao.Root(), TestPass::composite).Detach());
+    ao.Attach(ShadingPass::preview, MakePipeline(device.Get(), ao.Root(), TestPass::preview).Detach());
+    if (!native || !sphere || !ao.HasPipeline(ShadingPass::composite) || !ao.HasPipeline(ShadingPass::preview))
         return 1;
 
     auto depth_desc = color_desc;
@@ -139,8 +163,9 @@ int main()
     depth_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     auto depth = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     auto color = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto preview = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
     auto later = Allocate(device.Get(), D3D12_HEAP_TYPE_DEFAULT, color_desc, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    auto rtvs = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2);
+    auto rtvs = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3);
     auto dsvs = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
     auto resources = MakeHeap(device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3,
                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
@@ -149,11 +174,11 @@ int main()
     UINT64 size = 0;
     device->GetCopyableFootprints(&color_desc, 0, 1, 0, &layout, nullptr, nullptr, &size);
     const UINT64 stride = (size + 511) & ~511ull;
-    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, stride * 2, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
+    const D3D12_RESOURCE_DESC buffer{D3D12_RESOURCE_DIMENSION_BUFFER, 0, stride * 3, 1, 1, 1, DXGI_FORMAT_UNKNOWN,
                                      {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
     auto readback = Allocate(device.Get(), D3D12_HEAP_TYPE_READBACK, buffer, D3D12_RESOURCE_STATE_COPY_DEST);
     auto constants = Allocate(device.Get(), D3D12_HEAP_TYPE_UPLOAD, buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!depth || !color || !later || !rtvs || !dsvs || !resources || !samplers || !readback || !constants)
+    if (!depth || !color || !preview || !later || !rtvs || !dsvs || !resources || !samplers || !readback || !constants)
         return 1;
 
     void *mapped = nullptr;
@@ -163,9 +188,11 @@ int main()
     constants->Unmap(0, nullptr);
 
     auto scene_rtv = rtvs->GetCPUDescriptorHandleForHeapStart();
-    auto later_rtv = scene_rtv;
-    later_rtv.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const auto rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const D3D12_CPU_DESCRIPTOR_HANDLE preview_rtv{scene_rtv.ptr + rtv_increment};
+    const D3D12_CPU_DESCRIPTOR_HANDLE later_rtv{preview_rtv.ptr + rtv_increment};
     device->CreateRenderTargetView(color.Get(), nullptr, scene_rtv);
+    device->CreateRenderTargetView(preview.Get(), nullptr, preview_rtv);
     device->CreateRenderTargetView(later.Get(), nullptr, later_rtv);
     D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
     dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
@@ -205,18 +232,18 @@ int main()
                                          IID_PPV_ARGS(&list))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
         return 1;
-    const D3D12_RECT crease{contact_edge, 0, 160, 64};
-    const D3D12_RECT silhouette{contact_edge, 64, 160, 128};
+    const D3D12_RECT crease{contact_edge, 0, 224, 64};
+    const D3D12_RECT silhouette{contact_edge, 64, 224, 128};
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.253f, 0, 1, &crease);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.7f, 0, 1, &silhouette);
     for (LONG x = 0; x < static_cast<LONG>(extent); ++x) {
-        const D3D12_RECT column{x, 128, x + 1, extent};
+        const D3D12_RECT column{x, 128, x + 1, 192};
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.18f + 0.0012f * x, 0, 1, &column);
     }
-    Transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    const float scene_color[]{0.8f, 0.8f, 0.8f, 0.25f};
+    const float scene_color[]{0.8f, 0.6f, 0.4f, 0.25f};
     list->ClearRenderTargetView(scene_rtv, scene_color, 0, nullptr);
+    list->ClearRenderTargetView(preview_rtv, scene_color, 0, nullptr);
     const D3D12_VIEWPORT viewport{0, 0, extent, extent, 0, 1};
     const D3D12_RECT scissor{0, 0, extent, extent};
     list->RSSetViewports(1, &viewport);
@@ -230,14 +257,25 @@ int main()
     list->SetGraphicsRootSignature(native_root.Get());
     for (UINT i = 0; i < tables.size(); ++i)
         list->SetGraphicsRootDescriptorTable(i, tables[i]);
+    const D3D12_RECT sphere_scissor{0, 192, extent, extent};
+    list->RSSetScissorRects(1, &sphere_scissor);
+    list->OMSetRenderTargets(0, nullptr, FALSE, &dsv_handle);
+    list->SetPipelineState(sphere.Get());
+    list->DrawInstanced(3, 1, 0, 0);
+    list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &scene_rtv, FALSE, nullptr);
-    ao.Bind(list.Get(), tables[0], tables[1]);
+    Transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ao.Bind(ShadingPass::composite, list.Get(), tables[0], tables[1]);
+    list->DrawInstanced(3, 1, 0, 0);
+    zzz_ao::CharacterAo::Restore(list.Get(), native.Get(), native_root.Get(), tables);
+    list->OMSetRenderTargets(1, &preview_rtv, FALSE, nullptr);
+    ao.Bind(ShadingPass::preview, list.Get(), tables[0], tables[1]);
     list->DrawInstanced(3, 1, 0, 0);
     zzz_ao::CharacterAo::Restore(list.Get(), native.Get(), native_root.Get(), tables);
     list->OMSetRenderTargets(1, &later_rtv, FALSE, nullptr);
     list->DrawInstanced(3, 1, 0, 0);
 
-    for (ID3D12Resource *result : {color.Get(), later.Get()}) {
+    for (ID3D12Resource *result : {color.Get(), preview.Get(), later.Get()}) {
         Transition(list.Get(), result, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
         const D3D12_TEXTURE_COPY_LOCATION src{result, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
         D3D12_TEXTURE_COPY_LOCATION dest{readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
@@ -253,14 +291,14 @@ int main()
         return 1;
     for (int i = 0; i < 2000 && fence->GetCompletedValue() == 0; ++i)
         Sleep(5);
-    const D3D12_RANGE read{0, static_cast<SIZE_T>(stride * 2)};
+    const D3D12_RANGE read{0, static_cast<SIZE_T>(stride * 3)};
     if (fence->GetCompletedValue() != 1 || FAILED(readback->Map(0, &read, &mapped)))
         return 1;
     const auto pixel = [&](UINT x, UINT y, UINT64 offset = 0) {
         return static_cast<const uint8_t *>(mapped) + offset + y * layout.Footprint.RowPitch + x * 4;
     };
-    constexpr int flat_color = 204;
     constexpr UINT profile_y = 32;
+    const int flat_color = pixel(24, profile_y)[0];
     int previous = flat_color;
     int shade_levels = 0;
     bool falls_off = true;
@@ -274,15 +312,32 @@ int main()
     falls_off &= shade_levels >= 8 && pixel(contact_edge - 12, profile_y)[0] < flat_color &&
                  pixel(contact_edge - 1, profile_y)[0] < 175;
 
-    bool neutral = pixel(24, profile_y)[0] == flat_color && pixel(contact_edge, profile_y)[0] == flat_color;
+    bool neutral = flat_color >= 190 && pixel(contact_edge, profile_y)[0] == flat_color;
+    const int tilted_color = pixel(contact_edge, 160)[0];
     for (UINT x = contact_edge - 25; x <= contact_edge + 25; ++x) {
         neutral &= pixel(x, 96)[0] == flat_color;
-        neutral &= pixel(x, 160)[0] == flat_color;
+        neutral &= std::abs(int(pixel(x, 160)[0]) - tilted_color) <= 1;
+    }
+    constexpr UINT sphere_y = 222;
+    bool form_shading = pixel(110, sphere_y)[0] - pixel(144, sphere_y)[0] >= 30 &&
+                        pixel(128, 239)[0] - pixel(128, 208)[0] >= 25;
+    bool matches_preview = pixel(40, sphere_y)[0] == 204 && pixel(40, sphere_y, stride)[0] == 0;
+    int previous_gray = pixel(110, sphere_y, stride)[0];
+    for (UINT x = 110; x <= 144; x += 2) {
+        const auto *gray = pixel(x, sphere_y, stride);
+        form_shading &= gray[0] <= previous_gray + 2 && previous_gray - gray[0] <= 30;
+        previous_gray = gray[0];
+        const float multiplier = 0.48f + 0.52f * gray[0] / 255.0f;
+        const auto *game = pixel(x, sphere_y);
+        matches_preview &= gray[0] == gray[1] && gray[0] == gray[2] && gray[3] == 64 &&
+                           std::abs(game[0] - 204.0f * multiplier) < 1.6f &&
+                           std::abs(game[1] - 153.0f * multiplier) < 1.6f &&
+                           std::abs(game[2] - 102.0f * multiplier) < 1.6f;
     }
     const bool blend_and_restore = pixel(contact_edge - 1, profile_y)[3] == 64 &&
-                                   pixel(4, profile_y, stride)[0] == 64 &&
-                                   pixel(4, profile_y, stride)[1] == 128 &&
-                                   pixel(4, profile_y, stride)[2] == 191;
+                                   pixel(4, profile_y, 2 * stride)[0] == 64 &&
+                                   pixel(4, profile_y, 2 * stride)[1] == 128 &&
+                                   pixel(4, profile_y, 2 * stride)[2] == 191;
     if (!falls_off) {
         std::cerr << "Unexpected contact profile.";
         for (UINT x = contact_edge - 25; x < contact_edge; ++x)
@@ -292,10 +347,14 @@ int main()
     const D3D12_RANGE written{0, 0};
     readback->Unmap(0, &written);
     if (!neutral)
-        std::cerr << "Occlusion leaked across a silhouette or darkened a planar surface.\n";
+        std::cerr << "Occlusion leaked across a silhouette or shading varied along a plane.\n";
+    if (!form_shading)
+        std::cerr << "The sphere did not have a gradual directional shading profile.\n";
+    if (!matches_preview)
+        std::cerr << "Grayscale preview disagreed with the shading applied to scene color.\n";
     if (!blend_and_restore)
         std::cerr << "Unexpected scene-color alpha or restored draw.\n";
-    if (!falls_off || !neutral || !blend_and_restore)
+    if (!falls_off || !neutral || !form_shading || !matches_preview || !blend_and_restore)
         return 1;
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info))) {
@@ -313,6 +372,6 @@ int main()
             }
         }
     }
-    std::cout << "Verified AO falloff, neutral planes, silhouette rejection, alpha and graphics state through D3D12 WARP.\n";
+    std::cout << "Verified sphere shading, preview parity, AO falloff, alpha and graphics state through D3D12 WARP.\n";
     return 0;
 }

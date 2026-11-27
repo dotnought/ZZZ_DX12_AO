@@ -21,3 +21,14 @@ float4 SceneColor(Vertex input) : SV_Target0
     const float depth = NativeDepth.SampleLevel(NativeSampler, input.uv, 0);
     return float4(depth, 0.5, 0.75, 1.0);
 }
+
+float SphereDepth(Vertex input) : SV_Depth
+{
+    const float3 ray = normalize(float3((input.uv * 2.0 - 1.0) * 0.58, 1.0));
+    const float3 center = float3(0.0, 0.87, 2.0);
+    const float projection = dot(ray, center);
+    const float discriminant = projection * projection - (dot(center, center) - 0.21 * 0.21);
+    if (discriminant < 0.0)
+        return 0.0;
+    return 0.5 / ((projection - sqrt(discriminant)) * ray.z);
+}

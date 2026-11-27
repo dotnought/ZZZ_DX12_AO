@@ -44,7 +44,9 @@ jobs:
         run: |
           $path = "build/Release/zzz_ao_capture.addon64"
           $addon = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $path).Path))
-          if (!$addon.Contains("Detail AO" + [char]0)) { throw "Missing Detail AO toggle." }
+          foreach ($label in @("Detail AO", "Shading View")) {
+            if (!$addon.Contains($label + [char]0)) { throw "Missing gameplay toggle: $label" }
+          }
           foreach ($label in @("Native detail AO", "Character detail AO", "Enable mask test", "Black mask", "Capture DX12 trace")) {
             if ($addon.Contains($label)) { throw "Unexpected control in gameplay build: $label" }
           }

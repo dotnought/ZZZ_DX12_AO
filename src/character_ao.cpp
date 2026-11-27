@@ -35,14 +35,24 @@ CharacterAo CharacterAo::Create(ID3D12Device *device)
     return ao;
 }
 
-void CharacterAo::Bind(ID3D12GraphicsCommandList *list, D3D12_GPU_DESCRIPTOR_HANDLE vertex_table,
+ID3D12PipelineState *CharacterAo::State(ShadingPass pass) const
+{
+    return (pass == ShadingPass::preview ? preview_ : composite_).Get();
+}
+
+void CharacterAo::Attach(ShadingPass pass, ID3D12PipelineState *pipeline)
+{
+    (pass == ShadingPass::preview ? preview_ : composite_).Attach(pipeline);
+}
+
+void CharacterAo::Bind(ShadingPass pass, ID3D12GraphicsCommandList *list, D3D12_GPU_DESCRIPTOR_HANDLE vertex_table,
                        D3D12_GPU_DESCRIPTOR_HANDLE depth) const
 {
     // Both handles are in the game's active heap. Compute bindings stay live.
     list->SetGraphicsRootSignature(root_.Get());
     list->SetGraphicsRootDescriptorTable(0, vertex_table);
     list->SetGraphicsRootDescriptorTable(1, depth);
-    list->SetPipelineState(pipeline_.Get());
+    list->SetPipelineState(State(pass));
 }
 
 void CharacterAo::Restore(ID3D12GraphicsCommandList *list, ID3D12PipelineState *original_pipeline,

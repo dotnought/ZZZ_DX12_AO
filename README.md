@@ -1,16 +1,18 @@
 # ZZZ DX12 AO
 
-The Windows x64 add-on adds soft contact occlusion to the native scene color in Zenless Zone Zero 3.2 before DLSS. It covers the player character and nearby world geometry.
+The Windows x64 add-on adds form shading and soft ambient occlusion to the native scene color in Zenless Zone Zero 3.2 before DLSS. It covers the character and other geometry in the game's scene depth.
 
 ## Use Detail AO
 
 Replace the previous `zzz_ao_capture.addon64` in the add-on directory of your full-add-on ReShade setup. At 3440×1440 with DLSS Performance, go to **Add-ons → ZZZ DX12 AO** and toggle **Detail AO**. It starts off and can be toggled during the same game session. The ReShade log reports `ZZZ AO submitted Detail AO before upscaling` on the first matching submission.
 
-Detail AO takes depth samples at staggered distances to retain close contact shading and give it a softer falloff. It rejects large depth gaps before interpolating the samples and subtracts the local depth slope to preserve flat surfaces. The add-on reuses the game's native depth view and fullscreen vertex shader for one RGB-only draw at 1720×720 before upscaling and HUD composition. The draw preserves scene alpha and restores the game's graphics state.
+**Shading View** displays the combined form shading and ambient occlusion in grayscale with expanded contrast. Enable **Detail AO** to use it. Toggle **Shading View** off to see the effect on the game's colors.
+
+Detail AO estimates surface orientation from the game's depth, smoothing the estimates along surfaces with a depth-aware filter. A broad camera-relative light gives rounded geometry a gradual light-to-dark transition. Short-range occlusion deepens overlaps and fades across nearby surfaces. The add-on reuses the native depth view and fullscreen vertex shader for one RGB-only draw at 1720×720 before upscaling and HUD composition. Both modes preserve scene alpha and restore the game's graphics state.
 
 ## Build on Windows 11
 
-Install Visual Studio Community 2026 with **Desktop development with C++**, the x64 MSVC toolchain, Windows SDK and CMake 4.2 or newer for the VS 2026 generator. Use a Windows SDK with the x64 DirectX Shader Compiler (`dxc.exe`). The add-on embeds its compiled native pixel shader. Run these commands in the **x64 Native Tools Command Prompt for VS** from the repository root.
+Install Visual Studio Community 2026 with **Desktop development with C++**, the x64 MSVC toolchain, Windows SDK and CMake 4.2 or newer for the VS 2026 generator. Use a Windows SDK with the x64 DirectX Shader Compiler (`dxc.exe`). The add-on embeds its compiled native pixel shaders. Run these commands in the **x64 Native Tools Command Prompt for VS** from the repository root.
 
 ```bat
 cmake -S . -B build -G "Visual Studio 18 2026" -A x64
@@ -29,7 +31,7 @@ Configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` to build the add-on without the sepa
 
 ## Optional development trace
 
-Configure a separate build with `-DZZZ_AO_ENABLE_TRACE=ON` to add **Capture DX12 trace** to the add-on panel. The default gameplay build has one **Detail AO** checkbox. When the trace button is available, it arms a short capture that begins when the overlay closes. The ReShade log reports the saved `zzz-ao-<pid>-<capture>.tsv` path in the Windows temporary folder.
+Configure a separate build with `-DZZZ_AO_ENABLE_TRACE=ON` to add **Capture DX12 trace** to the add-on panel. When the trace button is available, it arms a short capture that begins when the overlay closes. The ReShade log reports the saved `zzz-ao-<pid>-<capture>.tsv` path in the Windows temporary folder.
 
 The trace records pass metadata and the shader bytecode used to identify the 3.2 depth and scene-color contracts. It also reads the game's preserved pre-AO depth and live depth after later draws, restoring the live depth plane state once the copies are recorded. The paired `character_depth` rows contain the stage name, sample size, and little-endian float32 device depths in hexadecimal.
 
@@ -46,7 +48,7 @@ Look for a recurring internal-size depth attachment and scene-color producer. Fo
 
 ## Validation and compute backend
 
-Configure with `-DZZZ_AO_TEST_DEPTH_CAPTURE=ON` to run the Windows D3D12 WARP tests. The scene test checks gradual contact falloff, neutral planar surfaces, depth discontinuities, scene alpha, and graphics state restoration. The depth test verifies the optional trace's readback. In-game appearance, motion and Frame Generation behavior, and GPU cost require testing on the target system.
+Configure with `-DZZZ_AO_TEST_DEPTH_CAPTURE=ON` to run the Windows D3D12 WARP tests. The scene test checks a smooth gradient across a sphere, agreement between both views, contact falloff, uniform shading on planes, depth discontinuities, scene alpha, and graphics state restoration. The depth test verifies the optional trace's readback. In-game appearance, motion and Frame Generation behavior, and GPU cost require testing on the target system.
 
 The repository also builds a standalone XeGTAO backend with projection-aware depth prefiltering, horizon sampling, and spatial denoising. Its API can write an R8 visibility texture or record a replacement into a caller-provided native visibility mask. The gameplay add-on uses its own shader and pre-DLSS composition path. [Backend API](src/xegtao_dx12.hpp) · [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO)
 
