@@ -24,6 +24,19 @@ float4 SceneColor(Vertex input) : SV_Target0
 
 float CurvedDepth(Vertex input) : SV_Depth
 {
+    const float2 pixel = input.position.xy - 0.5;
+    if (pixel.x >= 213.0)
+    {
+        // A separated silhouette in front of shallow staircase depth steps.
+        const float2 detached = pixel - float2(235, 231);
+        return dot(detached, detached) <= 64.0 ? 0.29 : 0.25 + 0.0015 * floor((pixel.y - 192.0) / 8.0);
+    }
+    if (pixel.x >= 174.0)
+    {
+        const float2 overlay = pixel - float2(193, 211);
+        return dot(overlay, overlay) <= 64.0 ? 0.253 : 0.25;
+    }
+
     // Piecewise-linear depth across a cylinder reproduces a faceted limb.
     const float acrossCylinder = (input.uv.x - 0.28) / 0.095;
     if (abs(acrossCylinder) < 1.0)

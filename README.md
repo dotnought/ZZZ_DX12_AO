@@ -6,9 +6,9 @@ The Windows x64 add-on adds form shading and soft ambient occlusion to the nativ
 
 Replace the previous `zzz_ao_capture.addon64` in the add-on directory of your full-add-on ReShade setup. At 3440×1440 with DLSS Performance, go to **Add-ons → ZZZ DX12 AO** and toggle **Detail AO**. It starts off and can be toggled during the same game session. The ReShade log reports `ZZZ AO submitted Detail AO before upscaling` on the first matching submission.
 
-**Shading View** displays the combined form shading and ambient occlusion in grayscale with expanded contrast. Enable **Detail AO** to use it. Toggle **Shading View** off to see the effect on the game's colors.
+**Shading View** displays the combined form shading and ambient occlusion in grayscale. Its scale shows lighting gains as well as shadows. Enable **Detail AO** to use it. Toggle **Shading View** off to see the effect on the game's colors.
 
-Detail AO estimates surface orientation from the game's depth. It averages slopes across neighboring rows and columns to smooth visible facets on curved surfaces. Each smoothing path checks for depth breaks before including more distant samples. A broad camera-relative light gives rounded geometry a gradual light-to-dark transition. Short-range occlusion scans adjacent samples along each direction for a single smooth falloff around thin overlaps. The add-on reuses the native depth view and fullscreen vertex shader for one RGB-only draw at 1720×720 before upscaling and HUD composition. Both modes preserve scene alpha and restore the game's graphics state.
+Detail AO estimates surface orientation from the game's depth. It averages slopes across neighboring rows and columns to smooth visible facets on curved surfaces. Each smoothing path checks for depth breaks before including more distant samples. Samples with less reliable depth information have less influence on the form near silhouettes. A broad camera-relative light brightens surfaces facing it and shades the far side. Short-range AO uses a circular footprint to fade evenly around overlaps and rejects separated depth layers. The add-on reuses the native depth view and fullscreen vertex shader for one RGB-only draw at 1720×720 before upscaling and HUD composition. Both modes preserve scene alpha and restore the game's graphics state.
 
 ## Build on Windows 11
 
@@ -48,7 +48,7 @@ Look for a recurring internal-size depth attachment and scene-color producer. Fo
 
 ## Validation and compute backend
 
-Configure with `-DZZZ_AO_TEST_DEPTH_CAPTURE=ON` to run the Windows D3D12 WARP tests. The scene test checks smooth gradients across a sphere and a faceted cylinder, agreement between both views, single shadow falloff around a thin foreground layer, uniform shading on planes, depth discontinuities, scene alpha, and graphics state restoration. The depth test verifies the optional trace's readback. In-game appearance, motion and Frame Generation behavior, and GPU cost require testing on the target system.
+Configure with `-DZZZ_AO_TEST_DEPTH_CAPTURE=ON` to run the Windows D3D12 WARP tests. The scene test checks highlights and smooth gradients across curved forms, agreement between both views, single shadow falloff around a thin foreground layer, even shading around a rounded silhouette, separated depth layers, scene alpha, and graphics state restoration. The depth test verifies the optional trace's readback. In-game appearance, motion and Frame Generation behavior, and GPU cost require testing on the target system.
 
 The repository also builds a standalone XeGTAO backend with projection-aware depth prefiltering, horizon sampling, and spatial denoising. Its API can write an R8 visibility texture or record a replacement into a caller-provided native visibility mask. The gameplay add-on uses its own shader and pre-DLSS composition path. [Backend API](src/xegtao_dx12.hpp) · [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO)
 

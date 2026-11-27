@@ -395,8 +395,8 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
                 shading.code = bytecode;
                 shading.code_size = sizeof(bytecode);
                 blend.blend_enable[0] = pass == ShadingPass::composite;
-                blend.source_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::zero : a::blend_factor::one;
-                blend.dest_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::source_color : a::blend_factor::zero;
+                blend.source_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::dest_color : a::blend_factor::one;
+                blend.dest_color_blend_factor[0] = blend.blend_enable[0] ? a::blend_factor::source_alpha : a::blend_factor::zero;
                 a::pipeline variant{};
                 if (device->create_pipeline(character_root, static_cast<uint32_t>(replacement.size()),
                                             replacement.data(), &variant))

@@ -106,8 +106,8 @@ ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignatu
         desc.PS = {curved_depth_ps_bytecode, sizeof(curved_depth_ps_bytecode)};
         break;
     }
-    desc.BlendState.RenderTarget[0] = {composite, FALSE, composite ? D3D12_BLEND_ZERO : D3D12_BLEND_ONE,
-        composite ? D3D12_BLEND_SRC_COLOR : D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+    desc.BlendState.RenderTarget[0] = {composite, FALSE, composite ? D3D12_BLEND_DEST_COLOR : D3D12_BLEND_ONE,
+        composite ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
         D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP,
         static_cast<UINT8>(pass == TestPass::game ? 0xf : 0x7)};
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -312,10 +312,10 @@ int main()
         const int value = pixel(x, profile_y)[0];
         if (value < previous)
             ++shade_levels;
-        falls_off &= value <= previous && previous - value <= 12;
+        falls_off &= value <= previous && previous - value <= 14;
         previous = value;
     }
-    falls_off &= shade_levels >= 8 && pixel(contact_edge - 12, profile_y)[0] < flat_color &&
+    falls_off &= shade_levels >= 7 && pixel(contact_edge - 6, profile_y)[0] < flat_color &&
                  pixel(contact_edge - 1, profile_y)[0] < 175;
 
     // A narrow layer should cast a single shadow on each side. A shallow
@@ -333,27 +333,38 @@ int main()
     for (UINT x = layer_left; x < layer_right; ++x)
         clean_overlay &= std::abs(int(pixel(x, 96, stride)[0]) - preview_flat) <= 2;
 
-    bool neutral = flat_color >= 190 && pixel(contact_edge, profile_y)[0] == flat_color;
+    bool neutral = flat_color == 204 && pixel(contact_edge, profile_y)[0] == flat_color;
     const int tilted_color = pixel(contact_edge, 160)[0];
     for (UINT x = contact_edge - 25; x <= contact_edge + 25; ++x) {
         neutral &= pixel(x, 96)[0] == flat_color;
         neutral &= std::abs(int(pixel(x, 160)[0]) - tilted_color) <= 1;
     }
     constexpr UINT sphere_y = 222;
-    bool form_shading = pixel(110, sphere_y)[0] - pixel(144, sphere_y)[0] >= 30 &&
-                        pixel(128, 239)[0] - pixel(128, 208)[0] >= 25;
+    bool form_shading = pixel(110, sphere_y)[0] - pixel(144, sphere_y)[0] >= 50 &&
+                        pixel(128, 239)[0] - pixel(128, 208)[0] >= 50;
+    form_shading &= pixel(128, 239)[0] > 211 && pixel(128, 208)[0] < 175;
     bool matches_preview = pixel(40, sphere_y)[0] == 204 && pixel(40, sphere_y, stride)[0] == 0;
     int previous_gray = pixel(110, sphere_y, stride)[0];
     for (UINT x = 110; x <= 144; x += 2) {
         const auto *gray = pixel(x, sphere_y, stride);
         form_shading &= gray[0] <= previous_gray + 2 && previous_gray - gray[0] <= 30;
         previous_gray = gray[0];
-        const float multiplier = 0.48f + 0.52f * gray[0] / 255.0f;
+        const float multiplier = 0.22f + 1.04f * gray[0] / 255.0f;
         const auto *game = pixel(x, sphere_y);
         matches_preview &= gray[0] == gray[1] && gray[0] == gray[2] && gray[3] == 64 &&
                            std::abs(game[0] - 204.0f * multiplier) < 1.6f &&
                            std::abs(game[1] - 153.0f * multiplier) < 1.6f &&
                            std::abs(game[2] - 102.0f * multiplier) < 1.6f;
+    }
+    const int horizontal_rim = pixel(205, 211, stride)[0];
+    bool even_silhouette = horizontal_rim < preview_flat - 6;
+    // Points at nearly the same radius should agree around the entire disk.
+    for (const auto &sample : {POINT{201, 220}, POINT{193, 223}, POINT{185, 220}, POINT{181, 211},
+                               POINT{185, 202}, POINT{193, 199}, POINT{201, 202}})
+        even_silhouette &= std::abs(int(pixel(sample.x, sample.y, stride)[0]) - horizontal_rim) <= 3;
+    for (UINT y = 229; y <= 233; ++y) {
+        for (UINT x = 244; x <= 246; ++x)
+            even_silhouette &= std::abs(int(pixel(x, y, stride)[0]) - pixel(225, y, stride)[0]) <= 1;
     }
     constexpr UINT cylinder_y = 220;
     const int cylinder_start = pixel(56, cylinder_y, stride)[0];
@@ -388,13 +399,16 @@ int main()
         std::cerr << "Occlusion leaked across a silhouette or shading varied along a plane.\n";
     if (!clean_overlay)
         std::cerr << "A narrow or shallow overlay produced a second contour.\n";
+    if (!even_silhouette)
+        std::cerr << "An occlusion wedge or depth leak appeared around a rounded silhouette.\n";
     if (!form_shading)
         std::cerr << "The sphere did not have a gradual directional shading profile.\n";
     if (!matches_preview)
         std::cerr << "Grayscale preview disagreed with the shading applied to scene color.\n";
     if (!blend_and_restore)
         std::cerr << "Unexpected scene-color alpha or restored draw.\n";
-    if (!falls_off || !clean_overlay || !neutral || !form_shading || !cylinder_smooth || !matches_preview || !blend_and_restore)
+    if (!falls_off || !clean_overlay || !even_silhouette || !neutral || !form_shading ||
+        !cylinder_smooth || !matches_preview || !blend_and_restore)
         return 1;
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info))) {
