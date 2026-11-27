@@ -14,7 +14,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr UINT extent = 32;
+constexpr UINT extent = 192;
+constexpr UINT contact_edge = extent / 2;
 constexpr DXGI_FORMAT color_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 constexpr D3D12_RESOURCE_DESC color_desc{
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, extent, extent, 1, 1, color_format,
@@ -204,11 +205,15 @@ int main()
                                          IID_PPV_ARGS(&list))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
         return 1;
-    const D3D12_RECT crease{12, 0, 19, 16};
-    const D3D12_RECT silhouette{12, 16, 19, 32};
+    const D3D12_RECT crease{contact_edge, 0, 160, 64};
+    const D3D12_RECT silhouette{contact_edge, 64, 160, 128};
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.25f, 0, 0, nullptr);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.253f, 0, 1, &crease);
     list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.7f, 0, 1, &silhouette);
+    for (LONG x = 0; x < static_cast<LONG>(extent); ++x) {
+        const D3D12_RECT column{x, 128, x + 1, extent};
+        list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 0.18f + 0.0012f * x, 0, 1, &column);
+    }
     Transition(list.Get(), depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_GENERIC_READ);
     const float scene_color[]{0.8f, 0.8f, 0.8f, 0.25f};
     list->ClearRenderTargetView(scene_rtv, scene_color, 0, nullptr);
@@ -254,15 +259,44 @@ int main()
     const auto pixel = [&](UINT x, UINT y, UINT64 offset = 0) {
         return static_cast<const uint8_t *>(mapped) + offset + y * layout.Footprint.RowPitch + x * 4;
     };
-    const bool correct = pixel(2, 8)[0] == 204 && pixel(11, 8)[0] < 190 && pixel(11, 8)[3] == 64 &&
-                         pixel(11, 24)[0] == 204 && pixel(4, 8, stride)[0] == 64 &&
-                         pixel(4, 8, stride)[1] == 128 && pixel(4, 8, stride)[2] == 191;
+    constexpr int flat_color = 204;
+    constexpr UINT profile_y = 32;
+    int previous = flat_color;
+    int shade_levels = 0;
+    bool falls_off = true;
+    for (UINT x = contact_edge - 25; x < contact_edge; ++x) {
+        const int value = pixel(x, profile_y)[0];
+        if (value < previous)
+            ++shade_levels;
+        falls_off &= value <= previous && previous - value <= 12;
+        previous = value;
+    }
+    falls_off &= shade_levels >= 8 && pixel(contact_edge - 12, profile_y)[0] < flat_color &&
+                 pixel(contact_edge - 1, profile_y)[0] < 175;
+
+    bool neutral = pixel(24, profile_y)[0] == flat_color && pixel(contact_edge, profile_y)[0] == flat_color;
+    for (UINT x = contact_edge - 25; x <= contact_edge + 25; ++x) {
+        neutral &= pixel(x, 96)[0] == flat_color;
+        neutral &= pixel(x, 160)[0] == flat_color;
+    }
+    const bool blend_and_restore = pixel(contact_edge - 1, profile_y)[3] == 64 &&
+                                   pixel(4, profile_y, stride)[0] == 64 &&
+                                   pixel(4, profile_y, stride)[1] == 128 &&
+                                   pixel(4, profile_y, stride)[2] == 191;
+    if (!falls_off) {
+        std::cerr << "Unexpected contact profile.";
+        for (UINT x = contact_edge - 25; x < contact_edge; ++x)
+            std::cerr << ' ' << int(pixel(x, profile_y)[0]);
+        std::cerr << '\n';
+    }
     const D3D12_RANGE written{0, 0};
     readback->Unmap(0, &written);
-    if (!correct) {
-        std::cerr << "Unexpected scene-color blend or restored draw.\n";
+    if (!neutral)
+        std::cerr << "Occlusion leaked across a silhouette or darkened a planar surface.\n";
+    if (!blend_and_restore)
+        std::cerr << "Unexpected scene-color alpha or restored draw.\n";
+    if (!falls_off || !neutral || !blend_and_restore)
         return 1;
-    }
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info))) {
         for (UINT64 i = 0; i < info->GetNumStoredMessagesAllowedByRetrievalFilter(); ++i) {
@@ -279,6 +313,6 @@ int main()
             }
         }
     }
-    std::cout << "Verified depth occlusion, untouched alpha and the restored graphics draw through D3D12 WARP.\n";
+    std::cout << "Verified AO falloff, neutral planes, silhouette rejection, alpha and graphics state through D3D12 WARP.\n";
     return 0;
 }

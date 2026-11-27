@@ -31,15 +31,6 @@ if(NOT IMGUI_INCLUDE_DIR)
 endif()
 
 find_program(DXC_EXECUTABLE NAMES dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
-set(native_ao_header "${CMAKE_CURRENT_BINARY_DIR}/generated/native_detail_ao.hpp")
-set(native_ao_dxil "${CMAKE_CURRENT_BINARY_DIR}/generated/native_detail_ao.dxil")
-add_custom_command(OUTPUT "${native_ao_header}" "${native_ao_dxil}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-    COMMAND "${DXC_EXECUTABLE}" -T ps_6_0 -E NativeDetailAo -O3 -Ges -WX
-        -Fo "${native_ao_dxil}" -Fh "${native_ao_header}" -Vn native_detail_ao_bytecode
-        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/native_detail_ao.hlsl"
-    DEPENDS shaders/native_detail_ao.hlsl
-    VERBATIM)
 set(character_ao_header "${CMAKE_CURRENT_BINARY_DIR}/generated/character_ao_ps.hpp")
 add_custom_command(OUTPUT "${character_ao_header}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -50,12 +41,16 @@ add_custom_command(OUTPUT "${character_ao_header}"
     DEPENDS shaders/character_ao.hlsl
     VERBATIM)
 add_custom_target(zzz_ao_character_shader DEPENDS "${character_ao_header}")
-add_library(zzz_ao_capture MODULE src/capture.cpp src/depth_capture.cpp src/character_ao.cpp
-    "${native_ao_header}")
+option(ZZZ_AO_ENABLE_TRACE "Enable the optional DX12 trace in the add-on panel" OFF)
+add_library(zzz_ao_capture MODULE src/capture.cpp src/character_ao.cpp)
 add_dependencies(zzz_ao_capture zzz_ao_character_shader)
 target_include_directories(zzz_ao_capture PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(zzz_ao_capture SYSTEM PRIVATE "${RESHADE_INCLUDE_DIR}" "${IMGUI_INCLUDE_DIR}")
 target_compile_definitions(zzz_ao_capture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+if(ZZZ_AO_ENABLE_TRACE)
+    target_sources(zzz_ao_capture PRIVATE src/depth_capture.cpp)
+    target_compile_definitions(zzz_ao_capture PRIVATE ZZZ_AO_ENABLE_TRACE)
+endif()
 target_link_libraries(zzz_ao_capture PRIVATE d3d12 user32)
 set_target_properties(zzz_ao_capture PROPERTIES
     PREFIX "" SUFFIX ".addon64"

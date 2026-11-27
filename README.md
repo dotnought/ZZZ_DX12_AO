@@ -1,6 +1,12 @@
 # ZZZ DX12 AO
 
-The Windows x64 add-on provides two AO paths for ZZZ 3.2. **Character detail AO** blends local occlusion into the game's scene before DLSS. **Native detail AO** replaces the game's world visibility resolve. The add-on also supports diagnostic mask overrides and a read-only DX12 trace. The separate XeGTAO backend can record a replacement into the game's R8 mask format.
+The Windows x64 add-on adds soft contact occlusion to the native scene color in Zenless Zone Zero 3.2 before DLSS. It covers the player character and nearby world geometry.
+
+## Use Detail AO
+
+Replace the previous `zzz_ao_capture.addon64` in the add-on directory of your full-add-on ReShade setup. At 3440×1440 with DLSS Performance, go to **Add-ons → ZZZ DX12 AO** and toggle **Detail AO**. It starts off and can be toggled during the same game session. The ReShade log reports `ZZZ AO submitted Detail AO before upscaling` on the first matching submission.
+
+Detail AO takes depth samples at staggered distances to retain close contact shading and give it a softer falloff. It rejects large depth gaps before interpolating the samples and subtracts the local depth slope to preserve flat surfaces. The add-on reuses the game's native depth view and fullscreen vertex shader for one RGB-only draw at 1720×720 before upscaling and HUD composition. The draw preserves scene alpha and restores the game's graphics state.
 
 ## Build on Windows 11
 
@@ -15,50 +21,17 @@ CMake downloads and verifies the pinned ReShade 6.7.3 and Dear ImGui 1.92.5 arch
 
 | Output | Path |
 | --- | --- |
-| In-game diagnostics | `build/Release/zzz_ao_capture.addon64` |
+| Gameplay add-on | `build/Release/zzz_ao_capture.addon64` |
 | Native C++ backend | `build/Release/zzz_ao_dx12.lib` |
 | Compute shader bytecode | `build/shaders/*.dxil` |
 
 Configure with `-DZZZ_AO_BUILD_COMPUTE=OFF` to build the add-on without the separate XeGTAO backend.
 
-## Character detail AO
+## Optional development trace
 
-Replace the previous `zzz_ao_capture.addon64` in your add-on directory. At 3440×1440 with DLSS Performance, go to **Add-ons → ZZZ DX12 AO Capture** and turn on **Character detail AO**. The toggle starts off and can be changed during play. The ReShade log reports `ZZZ AO submitted character detail AO before upscaling` on the first matching submission.
+Configure a separate build with `-DZZZ_AO_ENABLE_TRACE=ON` to add **Capture DX12 trace** to the add-on panel. The default gameplay build has one **Detail AO** checkbox. When the trace button is available, it arms a short capture that begins when the overlay closes. The ReShade log reports the saved `zzz-ao-<pid>-<capture>.tsv` path in the Windows temporary folder.
 
-The character is already visible in the captured pre-AO depth. The before-upscale depth agrees with it at 309,368 of 309,600 sampled positions. In the earlier screenshots, changing the world visibility mask changed the curbs while producing little visible change on the character.
-
-The new pass reads the preserved native depth SRV used by the game's CapsuleAO compute shader and blends local contact occlusion into the internal scene color that the game later copies for DLSS. It uses the game's fullscreen vertex shader to align the depth samples with the scene. It targets RGB at 1720×720 before HUD composition, preserves alpha, and reuses the game's existing resource and sampler heaps. It records one extra draw at the matching scene-color pass. The stock world AO still runs, and the two add-on AO toggles select separate modes. The scene-color blend affects nearby world geometry as well as characters. The DX12 tests cover the blend and graphics state restoration. In-game appearance, Frame Generation behavior, and GPU time still need verification.
-
-## Native detail AO
-
-At 3440×1440 with DLSS Performance, expand **Add-ons → ZZZ DX12 AO Capture** and toggle **Native detail AO**. Check hairlines, collars, layered clothing and curb edges in the same scene. Turn the toggle off to restore the stock shader. The ReShade log reports `ZZZ AO submitted native detail AO` when a matching draw is submitted.
-
-The captured DXIL confirms the original full-resolution resolve reads scene device depth at `t0`, half-resolution eye depth at `t1`, a material flag in `t2.a` and filtered visibility at `t3`. Its `b0` constants supply the eye-depth conversion. The original resolve returns full visibility when the material flag exceeds 0.5. The detail shader keeps the native half-resolution mask as its base and calculates short-range occlusion from the full-resolution depth, including valid geometry behind the original exclusion. It rejects large depth jumps and projects the local depth slope out of the estimate.
-
-The add-on creates the variant from the original PSO with the same root signature and uses it for the matched R8 resolve draw. It restores the original PSO immediately afterward. The toggle is off at startup. The 3.2 shader fingerprint, ordered mask draws, root layout and 1720×720 render extent must match. The in-game comparison showed additional curb shading with little visible change on the character. The replacement uses depth already bound at this pass. Character shading can come from a later draw or a different lighting path. GPU cost still needs measurement.
-
-## ZZZ 3.2 mask test
-
-The supplied traces at 3440×1440 with DLSS Performance show a 1720×720 scene viewport. They contain six scene recordings, two with Frame Generation on and four with it off. The other two observed presentations with Frame Generation on contain only a final image copy. This is consistent with generated presentations, but the trace does not tag them directly.
-
-All six scene recordings contain the same three consecutive pixel shaders producing two distinct 860×360 R8 resources and a 1720×720 R8 resource in that order. The final mask transitions to a readable state just before the suspected lighting shader `16383356142044416029`. The white override visibly reduces shading along curb edges and under furniture. Black darkens the road and storefronts while leaving sampled patches on the player character nearly unchanged. This confirms the native mask's contribution to environment contact shading. Character depth coverage and lighting integration still need investigation. A different compute shader also produces a half-resolution R8 candidate. Both traces show a copied 1720×720 typeless depth-stencil resource viewed as `R32_FLOAT_X8X24_TYPELESS`. Later, internal-size color, depth and two-channel textures are copied before the first 3440×1440 output draw. The exact DLSS evaluation call is outside the observed draw and dispatch events.
-
-To test the native mask, replace the old capture DLL with this build. In the same scene with DLSS Performance at 3440×1440, open the ReShade overlay and go to **Add-ons → ZZZ DX12 AO Capture**. Click **Enable mask test**, then compare the contact shading in the game. The probe writes white after the matching native draw. If you see no change, select **Black mask** in the panel and check again. Use **Disable mask test** to restore the native output. The ReShade log records the first matching submission for each setting. A brief description of what changed is enough for this test. If nothing changed, include whether the log reported an override.
-
-## Character depth capture
-
-At the observed 3.2 pre-upscale copy, the capture reads the game's preserved pre-AO depth and the live scene depth after later draws. It tracks both textures from the game's own depth copy and restores the live depth plane's state after the readback. No sampling runs outside an armed capture and the GPU fence is polled without a CPU wait. The TSV includes two `character_depth` rows containing stage, sample width, sample height and little-endian float32 depth samples in hexadecimal. It also saves bytecode for selected late scene shaders. The depth pair can show whether the character was already available to screen-space AO. It cannot identify every character material from depth alone.
-
-## First in-game capture
-
-Use the documented add-on directory of your existing authorized, full-add-on ReShade setup. The add-on uses ReShade 6.7.3 headers (API 18). Check the host's log for `ZZZ AO DX12 diagnostics loaded` after startup. Keep the capture DLL out of the ReShade shader directory.
-
-1. In DX12 gameplay, use 3440×1440, DLSS Performance and native Frame Generation on. Disable MXAO and its supporting ReShade effects for the capture. Choose a scene where a character is near floor or wall geometry.
-2. Click **Capture DX12 trace** in **Add-ons → ZZZ DX12 AO Capture**, then close the overlay. The recorder collects four observed presentations on that swapchain after the overlay closes. Confirm `ZZZ AO capture saved` in the ReShade log and find `zzz-ao-<pid>-<capture>.tsv` in `%TEMP%`.
-3. In that same scene and camera position, switch native Frame Generation off and click **Capture DX12 trace** again. Keep DLSS Performance enabled. Restore your settings afterwards.
-4. Send both TSV files and indicate which one used Frame Generation. Include the game or ReShade version only if it changed since the previous capture. If the add-on fails to load or save, send the corresponding ReShade log lines.
-
-If the capture shows several plausible scaling chains, the next comparison is a capture with super resolution off. Use the first two traces to decide whether that comparison is needed. This diagnostic build is for pass discovery. Benchmark without the capture add-on loaded because observing descriptor copies introduces CPU overhead.
+The trace records pass metadata and the shader bytecode used to identify the 3.2 depth and scene-color contracts. It also reads the game's preserved pre-AO depth and live depth after later draws, restoring the live depth plane state once the copies are recorded. The paired `character_depth` rows contain the stage name, sample size, and little-endian float32 device depths in hexadecimal.
 
 ## Reading the trace
 
@@ -71,17 +44,11 @@ If the capture shows several plausible scaling chains, the next comparison is a 
 
 Look for a recurring internal-size depth attachment and scene-color producer. Follow their consumers and the first scaling-sized output. A plausible native AO pass reads depth and possibly normals, writes a separate visibility target, and feeds an ambient lighting pass. Verify those roles from multiple observations, shader evidence, or an authorized GPU capture. The four observed presentations can help compare Frame Generation modes, while presentation callbacks alone cannot classify generated frames or prove the DLSS evaluation boundary.
 
-## Integration and performance
+## Validation and compute backend
 
-The backend records a depth mip prefilter, one of four XeGTAO horizon passes, and edge-aware spatial denoising to an R8 visibility texture. Enable, intensity, view-space radius, falloff, sample quality, denoising and distance fade are independent. The backend accepts an active internal-resolution rectangle, native device depth conversion, jitter-aware view rays, and optional signed view-space normals. When normals are absent it derives them from depth. A temporal index can advance on each real render frame once a temporal consumer has been verified.
+Configure with `-DZZZ_AO_TEST_DEPTH_CAPTURE=ON` to run the Windows D3D12 WARP tests. The scene test checks gradual contact falloff, neutral planar surfaces, depth discontinuities, scene alpha, and graphics state restoration. The depth test verifies the optional trace's readback. In-game appearance, motion and Frame Generation behavior, and GPU cost require testing on the target system.
 
-The host must supply an SRV-compatible depth view and confirmed projection, choose a real-frame recording point on the render queue, and manage input states, lifetimes and fence slots. The backend uses dedicated DIRECT command lists on one render queue and tracks transitions for its own textures. The queue serializes shared scratch textures, while each in-flight slot retains its output, descriptors and timestamps. It emits two GPU timestamps and resolves them to readback storage without a CPU wait. `ResidentTextureBytes()` reports committed allocation sizes for its default-heap textures, excluding descriptors, queries and readback. Recreate the backend when the padded render extent changes, after the old work retires. `RecordToNativeMask` copies the active XeGTAO output into the existing single-sample R8 mask target and returns it to render-target state. Timing for that method includes the mask write. A live XeGTAO swap still needs confirmed projection inputs and command-list state management for the compute dispatch. The native detail test above uses the existing pixel-shader bindings. The backend contract is in [src/xegtao_dx12.hpp](src/xegtao_dx12.hpp).
-
-A confirmed native ambient/indirect lighting consumer is the preferred AO composition point. If that path is inaccessible, validate an internal-resolution scene-color composition point before DLSS Super Resolution and HUD rendering. NVIDIA documents the separate scaling input, depth, motion vectors and HUD-less inputs, so the observer needs to establish how ZZZ uses them. HoYoverse documents the graphics settings without publishing the underlying resource bindings. [DLSS Super Resolution integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS.md) · [DLSS Frame Generation integration](https://github.com/NVIDIAGameWorks/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md) · [ZZZ PC visual experience FAQ](https://zenless.hoyoverse.com/en-us/news/165408?catchSpider=1&lang=en-us&page=news)
-
-The ZZZ 3.2 override validates the native environment visibility mask. Replacing the calculation at that mask lets the game consume the result through its existing lighting path. How much of the character shading uses that path is still open. For replacement, XeGTAO's three-stage compute path, native-depth input, optional normals, compact visibility output and spatial denoiser are a good fit for internal-resolution AO feeding DLSS. CACAO offers adaptive and downsampled operation with additional pass/resource configurations. Both are MIT-licensed. The initial backend uses FP32 depth for the reconstructed-normal path. A measured FP16 path with confirmed native normals is a later optimization. The ReShade depth, frame-effect and shader replacement examples and RenoDX demonstrate relevant observation and in-frame add-on patterns. [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO) · [AMD CACAO](https://gpuopen.com/fidelityfx-cacao/) · [ReShade examples](https://github.com/crosire/reshade/tree/v6.7.3/examples) · [RenoDX](https://github.com/clshortfuse/renodx)
-
-The first composition build still needs game validation for HUD isolation, stable motion, Frame Generation parity, resize and alt-tab behavior, and scene transitions. In-game settings UI, debug visualization and AO resolution scaling are pending that integration. Measure AO plus composition GPU time, report median and 95th percentile, and compare frame time against the unmodified game and visually matched iMMERSE MXAO at the same settings. Treat 0.5, 1, 2 and 3 ms for Low through Ultra as targets for the RTX 4060 Ti.
+The repository also builds a standalone XeGTAO backend with projection-aware depth prefiltering, horizon sampling, and spatial denoising. Its API can write an R8 visibility texture or record a replacement into a caller-provided native visibility mask. The gameplay add-on uses its own shader and pre-DLSS composition path. [Backend API](src/xegtao_dx12.hpp) · [Intel XeGTAO](https://github.com/GameTechDev/XeGTAO)
 
 ## Dependencies and licenses
 
@@ -93,4 +60,4 @@ The first composition build still needs game validation for HUD isolation, stabl
 | [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) | Build tool from the Windows SDK, NCSA license. DXC binaries are supplied by the installed SDK. |
 | [Windows SDK and D3D12](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/) | Visual Studio/Windows SDK installation and system Direct3D 12 runtime under Microsoft's terms. |
 
-CACAO, RenoDX, NVIDIA Streamline and the game are references for this milestone. The build fetches only the ReShade and Dear ImGui header dependencies and ships no game or NVIDIA binaries.
+The build fetches the ReShade and Dear ImGui header dependencies. The gameplay package contains the add-on, this README, and the dependency license notices.

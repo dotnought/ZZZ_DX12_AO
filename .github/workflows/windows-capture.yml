@@ -1,4 +1,4 @@
-name: Windows DX12 capture build
+name: Windows DX12 AO build
 
 on:
   push:
@@ -12,7 +12,6 @@ on:
       - tests/depth_capture_test.cpp
       - tests/character_ao_test.cpp
       - tests/character_scene.hlsl
-      - shaders/native_detail_ao.hlsl
       - shaders/character_ao.hlsl
       - src/character_ao.cpp
       - src/character_ao.hpp
@@ -25,31 +24,37 @@ permissions:
   contents: read
 
 jobs:
-  capture:
+  addon:
     runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: Build capture add-on
+      - name: Build gameplay add-on
         run: |
           $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
           $dxc = Get-ChildItem "$sdk/*/x64/dxc.exe" |
             Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
             Select-Object -First 1
           if (!$dxc) { throw 'DirectX Shader Compiler was not found in the Windows SDK.' }
-          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF -DZZZ_AO_TEST_DEPTH_CAPTURE=ON "-DDXC_EXECUTABLE=$($dxc.FullName)"
+          cmake -S . -B build -G "Visual Studio 18 2026" -A x64 -DZZZ_AO_BUILD_COMPUTE=OFF -DZZZ_AO_ENABLE_TRACE=OFF -DZZZ_AO_TEST_DEPTH_CAPTURE=ON "-DDXC_EXECUTABLE=$($dxc.FullName)"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config Release --target zzz_ao_capture zzz_ao_depth_capture_test zzz_ao_character_test
       - name: Test D3D12 depth readback and AO composition
         run: ctest --test-dir build -C Release --output-on-failure
-      - name: Package focused build
+      - name: Verify and package gameplay build
         run: |
+          $path = "build/Release/zzz_ao_capture.addon64"
+          $addon = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Resolve-Path $path).Path))
+          if (!$addon.Contains("Detail AO" + [char]0)) { throw "Missing Detail AO toggle." }
+          foreach ($label in @("Native detail AO", "Character detail AO", "Enable mask test", "Black mask", "Capture DX12 trace")) {
+            if ($addon.Contains($label)) { throw "Unexpected control in gameplay build: $label" }
+          }
           New-Item -Type Directory -Path package
-          Copy-Item build/Release/zzz_ao_capture.addon64 package/
+          Copy-Item $path package/
           Copy-Item README.md package/
           Copy-Item third_party/reshade/LICENSE.md package/ReShade-LICENSE.md
           Copy-Item third_party/imgui/LICENSE.txt package/Dear-ImGui-LICENSE.txt
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: zzz-ao-dx12-capture
+          name: zzz-dx12-ao
           path: package/
           if-no-files-found: error

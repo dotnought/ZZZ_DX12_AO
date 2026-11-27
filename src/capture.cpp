@@ -2,10 +2,11 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
-#include "native_detail_ao.hpp"
 #include "character_ao.hpp"
 #include "character_ao_ps.hpp"
+#ifdef ZZZ_AO_ENABLE_TRACE
 #include "depth_capture.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -27,13 +28,18 @@ namespace {
 using namespace reshade;
 namespace a = reshade::api;
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 constexpr unsigned interval_count = 4;
 constexpr unsigned max_depth_intervals = interval_count * 2;
 constexpr size_t max_list_rows = 24000;
 constexpr size_t max_trace_rows = 120000;
 constexpr size_t max_live_rows = 120000;
+#endif
+
 constexpr size_t max_descriptor_slots = 524288;
+#ifdef ZZZ_AO_ENABLE_TRACE
 constexpr uint32_t max_range_slots = 64;
+#endif
 constexpr GUID heap_id_guid{0x31d39db3, 0x725b, 0x467c, {0xae, 0x93, 0x12, 0x2c, 0x3d, 0x87, 0x95, 0x31}};
 
 struct Texture {
@@ -52,27 +58,24 @@ struct Pipeline {
     uint64_t pixel_shader = 0;
     uint64_t compute_shader = 0;
     uint64_t layout = 0;
-    a::pipeline detail_ao{};
     zzz_ao::CharacterAo character_ao;
     a::format color_format = a::format::unknown;
 };
 
-// These fingerprints were present in the ZZZ 3.2 traces. Keep the cached
-// shader contracts limited to the observed depth and native mask sequence.
-constexpr uint64_t half_mask_shader = 10793278501038871532ull;
-constexpr uint64_t blur_mask_shader = 18023612121467718113ull;
-constexpr uint64_t upsample_mask_shader = 9317972913748041275ull;
+// These two passes identify the depth source and the pre-DLSS scene color in ZZZ 3.2.
 constexpr uint64_t capsule_ao_shader = 2471263705428555365ull;
 constexpr uint64_t prescale_scene_shader = 7607800794214941815ull;
+
+#ifdef ZZZ_AO_ENABLE_TRACE
 struct NativeShader {
     uint64_t fingerprint;
     const char *name;
 };
 constexpr auto native_shaders = std::to_array<NativeShader>({
     {6709996353822950300ull, "ps_before_half_mask"},
-    {half_mask_shader, "ps_half_mask"},
-    {blur_mask_shader, "ps_blur_mask"},
-    {upsample_mask_shader, "ps_upsample_mask"},
+    {10793278501038871532ull, "ps_half_mask"},
+    {18023612121467718113ull, "ps_blur_mask"},
+    {9317972913748041275ull, "ps_upsample_mask"},
     {16383356142044416029ull, "ps_lighting_candidate"},
     {capsule_ao_shader, "cs_half_resolution_mask"},
     {15181696564642202686ull, "ps_after_world_lighting_1"},
@@ -106,11 +109,10 @@ struct List {
     bool prescale_scene_seen = false;
 };
 
+#endif
+
 constexpr uint32_t probe_width = 1720;
 constexpr uint32_t probe_height = 720;
-
-enum class MaskOverride : uint8_t { off, white, black, detail, character };
-enum class MaskStage : uint8_t { waiting, half, blurred };
 
 struct CharacterInputs {
     a::resource depth_target{};
@@ -124,36 +126,32 @@ struct CharacterInputs {
     std::array<a::descriptor_table, 3> graphics_tables{};
 };
 
-struct MaskList {
+struct AoList {
     uint64_t pixel_shader = 0;
     uint64_t graphics_layout = 0;
     a::pipeline pipeline{};
     a::resource_view target{};
     a::resource target_resource{};
-    a::resource half_resource{};
     a::viewport viewport{};
-    MaskStage stage = MaskStage::waiting;
     bool render_pass_open = false;
     bool modified = false;
     CharacterInputs character;
 };
 
-struct MaskProbe {
+struct AoRuntime {
     a::swapchain *swapchain = nullptr;
     HWND window = nullptr;
-    MaskOverride mode = MaskOverride::off;
     bool reported = false;
-    std::unordered_map<a::command_list *, MaskList> lists;
+    std::unordered_map<a::command_list *, AoList> lists;
 };
 
 struct Controls {
     a::effect_runtime *runtime = nullptr;
     bool detail_ao = false;
-    bool character_ao = false;
-    bool mask_enabled = false;
-    bool black_mask = false;
+#ifdef ZZZ_AO_ENABLE_TRACE
     bool capture_requested = false;
     bool overlay_open = false;
+#endif
 };
 
 struct HeapSlot {
@@ -164,6 +162,7 @@ struct HeapSlot {
     uint64_t key(uint32_t offset = 0) const { return (heap << 32) | (index + offset); }
 };
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 struct Capture {
     a::swapchain *swapchain = nullptr;
     a::device *device = nullptr;
@@ -179,25 +178,31 @@ struct Capture {
     std::shared_ptr<zzz_ao::DepthCapture> depth;
     bool depth_copy_point_seen = false;
 };
+#endif
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 std::atomic_bool capturing{false};
-std::atomic_bool probing{false};
 std::atomic_bool depth_pending{false};
-MaskProbe mask_probe;
-Controls controls;
-std::mutex mutex;
 Capture capture;
 std::shared_ptr<zzz_ao::DepthCapture> pending_depth;
+std::array<std::vector<uint8_t>, native_shaders.size()> native_shader_code;
+uint64_t next_capture_id = 0;
+#endif
+std::atomic_bool ao_active{false};
+AoRuntime ao_runtime;
+Controls controls;
+std::mutex mutex;
 std::unordered_map<uint64_t, Texture> textures;
 std::unordered_map<uint64_t, Pipeline> pipelines;
-std::array<std::vector<uint8_t>, native_shaders.size()> native_shader_code;
 std::unordered_map<uint64_t, std::vector<std::vector<a::descriptor_range>>> layouts;
 std::unordered_map<uint64_t, Descriptor> descriptors;
 uint64_t next_texture_id = 0;
 uint32_t next_heap_id = 0;
-uint64_t next_capture_id = 0;
+#ifdef ZZZ_AO_ENABLE_TRACE
 bool descriptor_limit_reached = false;
+#endif
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 template <typename... Args>
 std::string line(const char *kind, const Args &...args)
 {
@@ -226,12 +231,14 @@ void append_trace(std::string row)
     else
         ++capture.dropped;
 }
+#endif
 
 bool dx12(a::device *device)
 {
     return device->get_api() == a::device_api::d3d12;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 template <typename Function>
 void on_list(a::command_list *cmd, const Function &callback)
 {
@@ -241,14 +248,15 @@ void on_list(a::command_list *cmd, const Function &callback)
     if (capture.device != nullptr && cmd->get_device() == capture.device)
         callback(capture.lists[cmd]);
 }
+#endif
 
 template <typename Function>
-void on_mask_list(a::command_list *cmd, const Function &callback)
+void on_ao_list(a::command_list *cmd, const Function &callback)
 {
-    if (!probing.load(std::memory_order_relaxed))
+    if (!ao_active.load(std::memory_order_relaxed))
         return;
     const std::lock_guard lock(mutex);
-    if (const auto state = mask_probe.lists.find(cmd); state != mask_probe.lists.end())
+    if (const auto state = ao_runtime.lists.find(cmd); state != ao_runtime.lists.end())
         callback(state->second);
 }
 
@@ -267,6 +275,7 @@ const Texture &texture(a::device *device, a::resource resource)
     return it->second;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 uint64_t emit_texture(const Texture &texture)
 {
     const auto &d = texture.desc;
@@ -283,6 +292,7 @@ uint64_t emit_resource(a::device *device, a::resource resource)
 {
     return resource.handle != 0 ? emit_texture(texture(device, resource)) : 0;
 }
+#endif
 
 void init_resource(a::device *device, const a::resource_desc &desc, const a::subresource_data *,
                    a::resource_usage, a::resource resource)
@@ -314,6 +324,7 @@ uint64_t fingerprint(const a::shader_desc &shader)
     return hash;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 size_t native_shader_index(uint64_t fingerprint)
 {
     return static_cast<size_t>(std::find_if(native_shaders.begin(), native_shaders.end(),
@@ -330,6 +341,7 @@ void cache_native_shader(uint64_t hash, const a::shader_desc *shader)
     const auto *bytes = static_cast<const uint8_t *>(shader->code);
     native_shader_code[index].assign(bytes, bytes + shader->code_size);
 }
+#endif
 
 void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
                    const a::pipeline_subobject *objects, a::pipeline pipeline)
@@ -340,7 +352,6 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
     info.layout = layout.handle;
     const a::shader_desc *pixel_shader = nullptr;
     const a::shader_desc *compute_shader = nullptr;
-    uint32_t pixel_index = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &item = objects[i];
         if (item.count != 1 || item.data == nullptr)
@@ -348,7 +359,6 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
         if (item.type == a::pipeline_subobject_type::pixel_shader) {
             pixel_shader = static_cast<const a::shader_desc *>(item.data);
             info.pixel_shader = fingerprint(*pixel_shader);
-            pixel_index = i;
         }
         if (item.type == a::pipeline_subobject_type::compute_shader) {
             compute_shader = static_cast<const a::shader_desc *>(item.data);
@@ -358,17 +368,7 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
             info.color_format = *static_cast<const a::format *>(item.data);
     }
 
-    if (info.pixel_shader == upsample_mask_shader && layout.handle && info.color_format == a::format::r8_unorm) {
-        // Reuse the native root signature, vertex shader and fixed-function
-        // state. The replacement reads the same descriptor slots.
-        std::vector<a::pipeline_subobject> replacement(objects, objects + count);
-        a::shader_desc detail = *pixel_shader;
-        detail.code = native_detail_ao_bytecode;
-        detail.code_size = sizeof(native_detail_ao_bytecode);
-        replacement[pixel_index].data = &detail;
-        if (!device->create_pipeline(layout, count, replacement.data(), &info.detail_ao))
-            log::message(log::level::warning, "ZZZ AO could not create the native detail AO pipeline.");
-    } else if (info.pixel_shader == prescale_scene_shader && layout.handle &&
+    if (info.pixel_shader == prescale_scene_shader && layout.handle &&
                (info.color_format == a::format::r8g8b8a8_unorm || info.color_format == a::format::r8g8b8a8_unorm_srgb)) {
         auto ao = zzz_ao::CharacterAo::Create(reinterpret_cast<ID3D12Device *>(device->get_native()));
         if (ao.Root()) {
@@ -402,32 +402,26 @@ void init_pipeline(a::device *device, a::pipeline_layout layout, uint32_t count,
             log::message(log::level::warning, "ZZZ AO could not create the character detail AO pipeline.");
     }
 
-    try {
-        const std::lock_guard lock(mutex);
-        cache_native_shader(info.pixel_shader, pixel_shader);
-        cache_native_shader(info.compute_shader, compute_shader);
-        pipelines.insert_or_assign(pipeline.handle, info);
-    } catch (...) {
-        if (info.detail_ao.handle)
-            device->destroy_pipeline(info.detail_ao);
-        throw;
-    }
+    const std::lock_guard lock(mutex);
+#ifdef ZZZ_AO_ENABLE_TRACE
+    cache_native_shader(info.pixel_shader, pixel_shader);
+    cache_native_shader(info.compute_shader, compute_shader);
+#endif
+    pipelines.insert_or_assign(pipeline.handle, std::move(info));
 }
 
 void destroy_pipeline(a::device *device, a::pipeline pipeline)
 {
     if (!dx12(device))
         return;
-    a::pipeline detail{};
+    Pipeline retired;
     {
         const std::lock_guard lock(mutex);
         if (const auto it = pipelines.find(pipeline.handle); it != pipelines.end()) {
-            detail = it->second.detail_ao;
+            retired = std::move(it->second);
             pipelines.erase(it);
         }
     }
-    if (detail.handle)
-        device->destroy_pipeline(detail);
 }
 
 void init_layout(a::device *device, uint32_t count, const a::pipeline_layout_param *params,
@@ -503,7 +497,9 @@ void set_slot(uint64_t key, const Descriptor &value)
     } else if (descriptors.size() < max_descriptor_slots || descriptors.contains(key)) {
         descriptors.insert_or_assign(key, value);
     } else {
+#ifdef ZZZ_AO_ENABLE_TRACE
         descriptor_limit_reached = true;
+#endif
     }
 }
 
@@ -569,18 +565,16 @@ void bind_tables(a::command_list *cmd, a::shader_stage stages, a::pipeline_layou
 {
     const bool graphics = (stages & a::shader_stage::all_graphics) != static_cast<a::shader_stage>(0);
     const bool compute = (stages & a::shader_stage::compute) != static_cast<a::shader_stage>(0);
-    on_mask_list(cmd, [&](MaskList &list) {
+    on_ao_list(cmd, [&](AoList &list) {
         auto &inputs = list.character;
         if (graphics) {
-            if (mask_probe.mode == MaskOverride::character) {
-                if (list.graphics_layout != layout.handle)
-                    inputs.graphics_tables = {};
-                for (uint32_t i = 0; i < count && size_t(first) + i < inputs.graphics_tables.size(); ++i)
-                    inputs.graphics_tables[first + i] = tables[i];
-            }
+            if (list.graphics_layout != layout.handle)
+                inputs.graphics_tables = {};
+            for (uint32_t i = 0; i < count && size_t(first) + i < inputs.graphics_tables.size(); ++i)
+                inputs.graphics_tables[first + i] = tables[i];
             list.graphics_layout = layout.handle;
         }
-        if (compute && mask_probe.mode == MaskOverride::character) {
+        if (compute) {
             if (inputs.compute_layout != layout.handle)
                 inputs.capsule_table = {};
             inputs.compute_layout = layout.handle;
@@ -588,6 +582,7 @@ void bind_tables(a::command_list *cmd, a::shader_stage stages, a::pipeline_layou
                 inputs.capsule_table = tables[0];
         }
     });
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) {
         if (graphics)
             list.graphics_layout = layout.handle;
@@ -621,8 +616,10 @@ void bind_tables(a::command_list *cmd, a::shader_stage stages, a::pipeline_layou
             }
         }
     });
+#endif
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void root_descriptor(a::command_list *cmd, a::shader_stage stages, a::pipeline_layout layout,
                      uint32_t parameter, const a::descriptor_table_update &update)
 {
@@ -636,18 +633,23 @@ void root_descriptor(a::command_list *cmd, a::shader_stage stages, a::pipeline_l
     });
 }
 
+#endif
+
 void bind_pipeline(a::command_list *cmd, a::pipeline_stage stages, a::pipeline pipeline)
 {
     if (stages == a::pipeline_stage::all_ray_tracing)
         return;
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) { list.pipeline = pipeline.handle; });
-    on_mask_list(cmd, [&](MaskList &list) {
+#endif
+    on_ao_list(cmd, [&](AoList &list) {
         const auto it = pipelines.find(pipeline.handle);
         list.pixel_shader = it != pipelines.end() ? it->second.pixel_shader : 0;
         list.pipeline = pipeline;
     });
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void targets(a::command_list *cmd, const char *kind, uint32_t count,
              const a::resource_view *colors, a::resource_view depth, bool explicit_pass = false)
 {
@@ -665,43 +667,52 @@ void targets(a::command_list *cmd, const char *kind, uint32_t count,
         append(list, std::move(row), true);
     });
 }
+#endif
 
 void bind_targets(a::command_list *cmd, uint32_t count, const a::resource_view *colors, a::resource_view depth)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     targets(cmd, "targets", count, colors, depth);
-    on_mask_list(cmd, [&](MaskList &list) {
+#endif
+    on_ao_list(cmd, [&](AoList &list) {
         auto *device = cmd->get_device();
         list.target = count == 1 && depth.handle == 0 ? colors[0] : a::resource_view{};
         list.target_resource = list.target.handle ? device->get_resource_from_view(list.target) : a::resource{};
-        if (mask_probe.mode == MaskOverride::character)
-            list.character.depth_target = count == 4 && depth.handle ? device->get_resource_from_view(depth) : a::resource{};
+        list.character.depth_target = count == 4 && depth.handle ? device->get_resource_from_view(depth) : a::resource{};
     });
 }
 
 void begin_pass(a::command_list *cmd, uint32_t count, const a::render_pass_render_target_desc *colors,
                 const a::render_pass_depth_stencil_desc *depth)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     a::resource_view views[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     const uint32_t limit = std::min<uint32_t>(count, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT);
     for (uint32_t i = 0; i < limit; ++i)
         views[i] = colors[i].view;
     targets(cmd, "begin_pass", limit, views, depth != nullptr ? depth->view : a::resource_view{}, true);
-    on_mask_list(cmd, [](MaskList &list) {
+#else
+    (void)count;
+    (void)colors;
+    (void)depth;
+#endif
+    on_ao_list(cmd, [](AoList &list) {
         list.render_pass_open = true;
-        list.stage = MaskStage::waiting;
         list.character.depth_target = {};
     });
 }
 
 void end_pass(a::command_list *cmd)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [](List &list) {
         list.explicit_render_pass = false;
         list.depth_target = {};
         list.color_target_count = 0;
         append(list, "end_pass");
     });
-    on_mask_list(cmd, [](MaskList &list) {
+#endif
+    on_ao_list(cmd, [](AoList &list) {
         list.render_pass_open = false;
         list.target = {};
         list.target_resource = {};
@@ -710,13 +721,15 @@ void end_pass(a::command_list *cmd)
 
 void viewport(a::command_list *cmd, uint32_t first, uint32_t count, const a::viewport *views)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) {
         for (uint32_t i = 0; i < count; ++i) {
             const auto &v = views[i];
             append(list, line("viewport", first + i, v.x, v.y, v.width, v.height, v.min_depth, v.max_depth), true);
         }
     });
-    on_mask_list(cmd, [&](MaskList &list) {
+#endif
+    on_ao_list(cmd, [&](AoList &list) {
         list.viewport = first == 0 && count == 1 ? views[0] : a::viewport{};
     });
 }
@@ -724,10 +737,8 @@ void viewport(a::command_list *cmd, uint32_t first, uint32_t count, const a::vie
 void barrier(a::command_list *cmd, uint32_t count, const a::resource *res,
              const a::resource_usage *before, const a::resource_usage *after)
 {
-    on_mask_list(cmd, [&](MaskList &list) {
+    on_ao_list(cmd, [&](AoList &list) {
         auto &inputs = list.character;
-        if (mask_probe.mode != MaskOverride::character)
-            return;
         for (uint32_t i = 0; i < count; ++i) {
             if (res[i] == inputs.copy_candidate)
                 inputs.copy_candidate = {};
@@ -741,6 +752,7 @@ void barrier(a::command_list *cmd, uint32_t count, const a::resource *res,
             }
         }
     });
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) {
         for (uint32_t i = 0; i < count; ++i) {
             if (res[i] == list.depth_copy_candidate)
@@ -756,8 +768,10 @@ void barrier(a::command_list *cmd, uint32_t count, const a::resource *res,
                 append(list, line("barrier", id, static_cast<uint32_t>(before[i]), static_cast<uint32_t>(after[i])));
         }
     });
+#endif
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 bool clear_depth(a::command_list *cmd, a::resource_view view, const float *depth, const uint8_t *,
                  uint32_t rect_count, const a::rect *)
 {
@@ -770,6 +784,7 @@ bool clear_depth(a::command_list *cmd, a::resource_view view, const float *depth
     });
     return false;
 }
+#endif
 
 bool full_scene_depth(a::device *device, a::resource resource)
 {
@@ -781,6 +796,7 @@ bool full_scene_depth(a::device *device, a::resource resource)
            desc.texture.samples == 1 && desc.texture.levels == 1 && desc.texture.depth_or_layers == 1;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void record_character_depth(a::command_list *cmd, List &list, a::resource source, a::resource dest)
 {
     if (capture.depth || pending_depth || list.explicit_render_pass)
@@ -813,10 +829,11 @@ void record_character_depth(a::command_list *cmd, List &list, a::resource source
         depth_pending.store(true, std::memory_order_relaxed);
     }
 }
+#endif
 
 bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
 {
-    on_mask_list(cmd, [&](MaskList &list) {
+    on_ao_list(cmd, [&](AoList &list) {
         auto &inputs = list.character;
         if (list.render_pass_open || !source.handle || source != inputs.copy_candidate)
             return;
@@ -827,6 +844,7 @@ bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
             inputs.depth_srv = {};
         }
     });
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) {
         const auto from = emit_resource(cmd->get_device(), source);
         const auto to = emit_resource(cmd->get_device(), dest);
@@ -834,9 +852,11 @@ bool copy_resource(a::command_list *cmd, a::resource source, a::resource dest)
             append(list, line("copy", from, to));
         record_character_depth(cmd, list, source, dest);
     });
+#endif
     return false;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 bool copy_texture(a::command_list *cmd, a::resource source, uint32_t source_subresource,
                   const a::subresource_box *, a::resource dest, uint32_t dest_subresource,
                   const a::subresource_box *, a::filter_mode)
@@ -849,31 +869,10 @@ bool copy_texture(a::command_list *cmd, a::resource source, uint32_t source_subr
     });
     return false;
 }
+#endif
 
-bool is_mask_target(a::device *device, const MaskList &list, uint32_t width, uint32_t height)
-{
-    const auto &v = list.viewport;
-    if (!list.target_resource.handle || list.render_pass_open || v.x != 0 || v.y != 0 ||
-        v.width != float(width) || v.height != float(height) ||
-        device->get_resource_from_view(list.target) != list.target_resource)
-        return false;
-
-    const auto view = device->get_resource_view_desc(list.target);
-    if (view.type != a::resource_view_type::texture_2d || view.format != a::format::r8_unorm ||
-        view.texture.first_level != 0 || view.texture.first_layer != 0)
-        return false;
-
-    const auto &desc = texture(device, list.target_resource).desc;
-    return screen_texture(desc) && desc.texture.width == width && desc.texture.height == height &&
-           desc.texture.samples == 1 && desc.texture.levels == 1 && desc.texture.depth_or_layers == 1 &&
-           (desc.texture.format == a::format::r8_typeless || desc.texture.format == a::format::r8_unorm);
-}
-
-struct MaskAction {
-    a::resource_view target{};
-    float value = 0;
+struct AoDraw {
     a::pipeline original{};
-    a::pipeline detail{};
     zzz_ao::CharacterAo character;
     a::pipeline_layout layout{};
     D3D12_GPU_DESCRIPTOR_HANDLE depth{};
@@ -924,7 +923,7 @@ bool prescale_layout_can_restore(uint64_t handle)
            params[2][0].type == a::descriptor_type::sampler && params[2][0].count == 4;
 }
 
-void prepare_character_draw(a::device *device, const MaskList &list, MaskAction &action)
+void prepare_character_draw(a::device *device, const AoList &list, AoDraw &action)
 {
     const auto &inputs = list.character;
     const auto &v = list.viewport;
@@ -950,7 +949,6 @@ void prepare_character_draw(a::device *device, const MaskList &list, MaskAction 
     // The pre-upscale pass and CapsuleAO must use the same bound resource heap.
     if (heap_slot(device, inputs.graphics_tables[1], 0).heap != inputs.depth_heap)
         return;
-    action.target = list.target;
     action.original = list.pipeline;
     action.character = pipeline->second.character_ao;
     action.layout = {list.graphics_layout};
@@ -959,6 +957,7 @@ void prepare_character_draw(a::device *device, const MaskList &list, MaskAction 
         action.tables[i] = {inputs.graphics_tables[i].handle};
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
 {
     const size_t index = native_shader_index(shader);
@@ -979,9 +978,11 @@ void mark_native_shader(List &list, uint64_t shader, uint64_t layout)
         }
     }
 }
+#endif
 
-MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t element_count)
+AoDraw observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t element_count)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [](List &list) {
         const auto it = pipelines.find(list.pipeline);
         const uint64_t shader = it != pipelines.end() ? it->second.pixel_shader : 0;
@@ -992,94 +993,57 @@ MaskAction observe_draw(a::command_list *cmd, uint32_t instance_count, uint32_t 
         append(list, line("draw", list.pipeline, shader, list.graphics_layout), true);
     });
 
-    MaskAction action;
-    on_mask_list(cmd, [&](MaskList &list) {
-        const auto previous = std::exchange(list.stage, MaskStage::waiting);
-        if (list.modified || instance_count != 1 || element_count == 0)
+#endif
+    AoDraw action;
+    on_ao_list(cmd, [&](AoList &list) {
+        if (list.modified || instance_count != 1 || element_count == 0 ||
+            list.pixel_shader != prescale_scene_shader || GetForegroundWindow() != ao_runtime.window)
             return;
-
-        auto *device = cmd->get_device();
-        if (mask_probe.mode == MaskOverride::character) {
-            if (list.pixel_shader == prescale_scene_shader && GetForegroundWindow() == mask_probe.window)
-                prepare_character_draw(device, list, action);
-            list.modified = action.target.handle != 0;
-            return;
-        }
-        if (list.pixel_shader == half_mask_shader &&
-            is_mask_target(device, list, probe_width / 2, probe_height / 2)) {
-            list.stage = MaskStage::half;
-            list.half_resource = list.target_resource;
-        } else if (list.pixel_shader == blur_mask_shader && previous == MaskStage::half &&
-                   list.target_resource != list.half_resource && is_mask_target(device, list, probe_width / 2, probe_height / 2)) {
-            list.stage = MaskStage::blurred;
-        } else if (list.pixel_shader == upsample_mask_shader && previous == MaskStage::blurred &&
-                   GetForegroundWindow() == mask_probe.window &&
-                   is_mask_target(device, list, probe_width, probe_height)) {
-            if (mask_probe.mode == MaskOverride::detail) {
-                const auto pipeline = pipelines.find(list.pipeline.handle);
-                if (pipeline == pipelines.end() || !pipeline->second.detail_ao.handle ||
-                    pipeline->second.layout != list.graphics_layout)
-                    return;
-                action.detail = pipeline->second.detail_ao;
-                action.original = list.pipeline;
-            }
-            list.modified = true;
-            action.target = list.target;
-            action.value = mask_probe.mode == MaskOverride::white ? 1.0f : 0.0f;
-        }
+        prepare_character_draw(cmd->get_device(), list, action);
+        list.modified = static_cast<bool>(action.character);
     });
     return action;
 }
 
 template <typename Draw>
-bool apply_mask(a::command_list *cmd, const MaskAction &action, const Draw &execute_draw)
+bool apply_ao(a::command_list *cmd, const AoDraw &action, const Draw &execute_draw)
 {
-    if (!action.target.handle)
+    if (!action.character)
         return false;
-    // The add-on API records directly without re-entering the draw event.
-    // Binding all stages changes only the PSO on D3D12.
-    if (action.detail.handle)
-        cmd->bind_pipeline(a::pipeline_stage::all, action.detail);
+
+    // Reissue the matched native draw, then draw visibility and restore its state.
     execute_draw();
-    if (action.character) {
-        auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
-        action.character.Bind(list, action.tables[0], action.depth);
-        execute_draw();
-        zzz_ao::CharacterAo::Restore(list, reinterpret_cast<ID3D12PipelineState *>(action.original.handle),
-                                    reinterpret_cast<ID3D12RootSignature *>(action.layout.handle), action.tables);
-    } else if (action.detail.handle) {
-        cmd->bind_pipeline(a::pipeline_stage::all, action.original);
-    } else {
-        const float color[]{action.value, action.value, action.value, action.value};
-        cmd->clear_render_target_view(action.target, color);
-    }
+    auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+    action.character.Bind(list, action.tables[0], action.depth);
+    execute_draw();
+    zzz_ao::CharacterAo::Restore(list, reinterpret_cast<ID3D12PipelineState *>(action.original.handle),
+                                reinterpret_cast<ID3D12RootSignature *>(action.layout.handle), action.tables);
     return true;
 }
 
 bool draw(a::command_list *cmd, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t first_instance)
 {
-    return apply_mask(cmd, observe_draw(cmd, instances, vertices),
+    return apply_ao(cmd, observe_draw(cmd, instances, vertices),
                       [&] { cmd->draw(vertices, instances, first, first_instance); });
 }
 
 bool draw_indexed(a::command_list *cmd, uint32_t indices, uint32_t instances, uint32_t first,
                   int32_t base, uint32_t first_instance)
 {
-    return apply_mask(cmd, observe_draw(cmd, instances, indices),
+    return apply_ao(cmd, observe_draw(cmd, instances, indices),
                       [&] { cmd->draw_indexed(indices, instances, first, base, first_instance); });
 }
 
 bool dispatch(a::command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
 {
-    on_mask_list(cmd, [&](MaskList &list) {
-        list.stage = MaskStage::waiting;
-        if (mask_probe.mode != MaskOverride::character ||
-            x != (probe_width + 31) / 32 || y != (probe_height + 31) / 32 || z != 1)
+    on_ao_list(cmd, [&](AoList &list) {
+        if (x != (probe_width + 31) / 32 || y != (probe_height + 31) / 32 || z != 1)
             return;
         const auto pipeline = pipelines.find(list.pipeline.handle);
         if (pipeline != pipelines.end() && pipeline->second.compute_shader == capsule_ao_shader)
             keep_capsule_depth(cmd->get_device(), pipeline->second, list.character);
     });
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(cmd, [&](List &list) {
         const auto it = pipelines.find(list.pipeline);
         const uint64_t shader = it != pipelines.end() ? it->second.compute_shader : 0;
@@ -1087,12 +1051,13 @@ bool dispatch(a::command_list *cmd, uint32_t x, uint32_t y, uint32_t z)
         mark_native_shader(list, shader, list.compute_layout ? list.compute_layout : layout);
         append(list, line("dispatch", list.pipeline, shader, list.compute_layout, x, y, z), true);
     });
+#endif
     return false;
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 bool indirect(a::command_list *cmd, a::indirect_command type, a::resource, uint64_t, uint32_t count, uint32_t)
 {
-    on_mask_list(cmd, [](MaskList &list) { list.stage = MaskStage::waiting; });
     on_list(cmd, [&](List &list) {
         const auto it = pipelines.find(list.pipeline);
         append(list, line("indirect", list.pipeline,
@@ -1102,13 +1067,18 @@ bool indirect(a::command_list *cmd, a::indirect_command type, a::resource, uint6
     });
     return false;
 }
+#endif
 
 void forget_list(a::command_list *cmd)
 {
-    if (!capturing.load(std::memory_order_relaxed) && !probing.load(std::memory_order_relaxed) &&
-        !depth_pending.load(std::memory_order_relaxed))
+    if (!ao_active.load(std::memory_order_relaxed)
+#ifdef ZZZ_AO_ENABLE_TRACE
+        && !capturing.load(std::memory_order_relaxed) && !depth_pending.load(std::memory_order_relaxed)
+#endif
+    )
         return;
     const std::lock_guard lock(mutex);
+#ifdef ZZZ_AO_ENABLE_TRACE
     if (pending_depth && pending_depth->IsList(reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native()))) {
         pending_depth->RetireList();
         if (!pending_depth->HasSubmission() || pending_depth->Ready()) {
@@ -1121,19 +1091,20 @@ void forget_list(a::command_list *cmd)
         capture.live_rows -= it->second.rows.size();
         capture.lists.erase(it);
     }
-    mask_probe.lists.erase(cmd);
+#endif
+    ao_runtime.lists.erase(cmd);
 }
 
 void init_list(a::command_list *cmd)
 {
-    if (!probing.load(std::memory_order_relaxed) || !dx12(cmd->get_device()))
+    if (!ao_active.load(std::memory_order_relaxed) || !dx12(cmd->get_device()))
         return;
     auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
     if (!list || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;
     const std::lock_guard lock(mutex);
-    if (mask_probe.swapchain && cmd->get_device() == mask_probe.swapchain->get_device())
-        mask_probe.lists.try_emplace(cmd);
+    if (ao_runtime.swapchain && cmd->get_device() == ao_runtime.swapchain->get_device())
+        ao_runtime.lists.try_emplace(cmd);
 }
 
 void reset_list(a::command_list *cmd)
@@ -1144,13 +1115,13 @@ void reset_list(a::command_list *cmd)
 
 void bundle(a::command_list *parent, a::command_list *child)
 {
-    on_mask_list(parent, [](MaskList &list) {
-        list.stage = MaskStage::waiting;
+    on_ao_list(parent, [](AoList &list) {
         list.pixel_shader = 0;
         list.graphics_layout = 0;
         list.pipeline = {};
         list.character = {};
     });
+#ifdef ZZZ_AO_ENABLE_TRACE
     on_list(parent, [&](List &list) {
         const auto it = capture.lists.find(child);
         append(list, line("begin_bundle", reinterpret_cast<uintptr_t>(child), it != capture.lists.end()));
@@ -1175,35 +1146,24 @@ void bundle(a::command_list *parent, a::command_list *child)
         list.depth_copy_candidate = {};
         list.live_depth_state = a::resource_usage::undefined;
     });
+#else
+    (void)child;
+#endif
 }
 
 void submit(a::command_queue *queue, a::command_list *cmd)
 {
-    const char *message = nullptr;
-    on_mask_list(cmd, [&](MaskList &list) {
-        if (list.modified && !mask_probe.reported) {
-            mask_probe.reported = true;
-            switch (mask_probe.mode) {
-            case MaskOverride::character:
-                message = "ZZZ AO submitted character detail AO before upscaling.";
-                break;
-            case MaskOverride::detail:
-                message = "ZZZ AO submitted native detail AO.";
-                break;
-            case MaskOverride::white:
-                message = "ZZZ AO mask probe submitted a white override.";
-                break;
-            case MaskOverride::black:
-                message = "ZZZ AO mask probe submitted a black override.";
-                break;
-            case MaskOverride::off:
-                break;
-            }
+    bool first_submission = false;
+    on_ao_list(cmd, [&](AoList &list) {
+        if (list.modified && !ao_runtime.reported) {
+            ao_runtime.reported = true;
+            first_submission = true;
         }
     });
-    if (message)
-        log::message(log::level::info, message);
+    if (first_submission)
+        log::message(log::level::info, "ZZZ AO submitted Detail AO before upscaling.");
 
+#ifdef ZZZ_AO_ENABLE_TRACE
     if (!capturing.load(std::memory_order_relaxed) && !depth_pending.load(std::memory_order_relaxed))
         return;
     const std::lock_guard lock(mutex);
@@ -1223,8 +1183,12 @@ void submit(a::command_queue *queue, a::command_list *cmd)
         append_trace(row.text + '\t' + std::to_string(row.repeat));
     if (it->second.dropped)
         append_trace(line("list_truncated", it->second.dropped));
+#else
+    (void)queue;
+#endif
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void save_native_shaders(std::ofstream &out, NativeShaderSet observed)
 {
     std::array<std::vector<uint8_t>, native_shaders.size()> shaders;
@@ -1275,6 +1239,7 @@ void save(Capture &finished)
     else
         log::message(log::level::error, "ZZZ AO could not write the capture to the Windows temporary folder.");
 }
+#endif
 
 void draw_settings(a::effect_runtime *runtime)
 {
@@ -1284,34 +1249,19 @@ void draw_settings(a::effect_runtime *runtime)
     const std::lock_guard lock(mutex);
     if (controls.runtime != runtime)
         controls = {runtime};
+    ImGui::Checkbox("Detail AO", &controls.detail_ao);
+
+#ifdef ZZZ_AO_ENABLE_TRACE
     controls.overlay_open = true;
-
-    if (ImGui::Checkbox("Character detail AO", &controls.character_ao) && controls.character_ao) {
-        controls.detail_ao = false;
-        controls.mask_enabled = false;
-    }
-    if (ImGui::Checkbox("Native detail AO", &controls.detail_ao) && controls.detail_ao) {
-        controls.character_ao = false;
-        controls.mask_enabled = false;
-    }
-    if (ImGui::Button(controls.mask_enabled ? "Disable mask test###mask_test"
-                                           : "Enable mask test###mask_test")) {
-        controls.mask_enabled = !controls.mask_enabled;
-        if (controls.mask_enabled) {
-            controls.detail_ao = false;
-            controls.character_ao = false;
-        }
-    }
-    if (controls.mask_enabled)
-        ImGui::Checkbox("Black mask", &controls.black_mask);
-
     ImGui::BeginDisabled(controls.capture_requested || capture.swapchain != nullptr);
     if (ImGui::Button(controls.capture_requested ? "Close overlay to capture###capture_trace"
                                                  : "Capture DX12 trace###capture_trace"))
         controls.capture_requested = true;
     ImGui::EndDisabled();
+#endif
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 bool overlay_state_changed(a::effect_runtime *runtime, bool open, a::input_source)
 {
     const std::lock_guard lock(mutex);
@@ -1319,17 +1269,19 @@ bool overlay_state_changed(a::effect_runtime *runtime, bool open, a::input_sourc
         controls.overlay_open = open;
     return false;
 }
+#endif
 
 void destroy_settings_runtime(a::effect_runtime *runtime)
 {
     const std::lock_guard lock(mutex);
     if (controls.runtime == runtime) {
         controls = {};
-        probing.store(false, std::memory_order_relaxed);
-        mask_probe = {};
+        ao_active.store(false, std::memory_order_relaxed);
+        ao_runtime = {};
     }
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void poll_depth_readback()
 {
     if (!pending_depth)
@@ -1340,6 +1292,7 @@ void poll_depth_readback()
         depth_pending.store(false, std::memory_order_relaxed);
     }
 }
+#endif
 
 void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, const a::rect *,
              uint32_t, const a::rect *)
@@ -1350,33 +1303,29 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
     const auto window = static_cast<HWND>(swapchain->get_hwnd());
     const bool focused = window && window == GetForegroundWindow();
 
+#ifdef ZZZ_AO_ENABLE_TRACE
     Capture finished;
-    bool probe_missed = false;
+#endif
+    bool pass_missed = false;
     {
         const std::lock_guard lock(mutex);
+#ifdef ZZZ_AO_ENABLE_TRACE
         poll_depth_readback();
+#endif
         const bool selected = focused && controls.runtime && controls.runtime->get_hwnd() == window &&
                               controls.runtime->get_device() == device;
-        auto mode = MaskOverride::off;
-        if (selected) {
-            if (controls.character_ao)
-                mode = MaskOverride::character;
-            else if (controls.detail_ao)
-                mode = MaskOverride::detail;
-            else if (controls.mask_enabled)
-                mode = controls.black_mask ? MaskOverride::black : MaskOverride::white;
+        const bool enabled = selected && controls.detail_ao;
+        if (enabled && ao_runtime.swapchain != swapchain) {
+            ao_runtime = {};
+            ao_runtime.swapchain = swapchain;
+            ao_runtime.window = window;
+            ao_active.store(true, std::memory_order_relaxed);
+        } else if (!enabled && ao_runtime.swapchain == swapchain) {
+            pass_missed = !ao_runtime.reported;
+            ao_runtime = {};
+            ao_active.store(false, std::memory_order_relaxed);
         }
-        if ((selected || mask_probe.swapchain == swapchain) &&
-            (mask_probe.mode != mode || (mode != MaskOverride::off && mask_probe.swapchain != swapchain))) {
-            probe_missed = mask_probe.mode != MaskOverride::off && !mask_probe.reported;
-            mask_probe = {};
-            if (mode != MaskOverride::off) {
-                mask_probe.swapchain = swapchain;
-                mask_probe.window = window;
-                mask_probe.mode = mode;
-            }
-            probing.store(mode != MaskOverride::off, std::memory_order_relaxed);
-        }
+#ifdef ZZZ_AO_ENABLE_TRACE
         if (capture.swapchain == swapchain) {
             ++capture.presents;
             append_trace(line("present", capture.presents, emit_resource(device, swapchain->get_current_back_buffer())));
@@ -1398,13 +1347,17 @@ void present(a::command_queue *queue, a::swapchain *swapchain, const a::rect *, 
             append_trace(line("begin", emit_resource(device, swapchain->get_current_back_buffer())));
             capturing.store(true, std::memory_order_relaxed);
         }
+#endif
     }
-    if (probe_missed)
-        log::message(log::level::info, "ZZZ AO mask probe found no matching submitted draw.");
+    if (pass_missed)
+        log::message(log::level::info, "ZZZ AO did not find a matching pre-DLSS draw.");
+#ifdef ZZZ_AO_ENABLE_TRACE
     if (finished.id != 0)
         save(finished);
+#endif
 }
 
+#ifdef ZZZ_AO_ENABLE_TRACE
 void finish_present(a::command_queue *, a::swapchain *)
 {
     if (!depth_pending.load(std::memory_order_relaxed))
@@ -1412,23 +1365,30 @@ void finish_present(a::command_queue *, a::swapchain *)
     const std::lock_guard lock(mutex);
     poll_depth_readback();
 }
+#endif
 
 void destroy_swapchain(a::swapchain *swapchain, bool)
 {
+#ifdef ZZZ_AO_ENABLE_TRACE
     Capture finished;
+#endif
     {
         const std::lock_guard lock(mutex);
-        if (mask_probe.swapchain == swapchain) {
-            probing.store(false, std::memory_order_relaxed);
-            mask_probe = {};
+        if (ao_runtime.swapchain == swapchain) {
+            ao_active.store(false, std::memory_order_relaxed);
+            ao_runtime = {};
         }
+#ifdef ZZZ_AO_ENABLE_TRACE
         if (capture.swapchain != swapchain)
             return;
         append_trace("swapchain_destroyed");
         capturing.store(false, std::memory_order_relaxed);
         finished = std::exchange(capture, Capture{});
+#endif
     }
+#ifdef ZZZ_AO_ENABLE_TRACE
     save(finished);
+#endif
 }
 
 // Never let a diagnostics allocation or file exception leave an add-on callback.
@@ -1452,8 +1412,8 @@ void observe()
 }
 } // namespace
 
-extern "C" __declspec(dllexport) const char *NAME = "ZZZ DX12 AO Capture";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Native detail AO, mask testing and DX12 capture for ZZZ 3.2.";
+extern "C" __declspec(dllexport) const char *NAME = "ZZZ DX12 AO";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Native detail ambient occlusion before DLSS in ZZZ 3.2.";
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
 {
@@ -1470,32 +1430,44 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
         observe<addon_event::update_descriptor_tables, update_descriptors>();
         observe<addon_event::copy_descriptor_tables, copy_descriptors>();
         observe<addon_event::bind_descriptor_tables, bind_tables>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::push_descriptors, root_descriptor>();
+#endif
         observe<addon_event::bind_pipeline, bind_pipeline>();
         observe<addon_event::bind_render_targets_and_depth_stencil, bind_targets>();
         observe<addon_event::begin_render_pass, begin_pass>();
         observe<addon_event::end_render_pass, end_pass>();
         observe<addon_event::bind_viewports, viewport>();
         observe<addon_event::barrier, barrier>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::clear_depth_stencil_view, clear_depth>();
+#endif
         observe<addon_event::copy_resource, copy_resource>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::copy_texture_region, copy_texture>();
+#endif
         observe<addon_event::draw, draw>();
         observe<addon_event::draw_indexed, draw_indexed>();
         observe<addon_event::dispatch, dispatch>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::draw_or_dispatch_indirect, indirect>();
+#endif
         observe<addon_event::init_command_list, init_list>();
         observe<addon_event::reset_command_list, reset_list>();
         observe<addon_event::destroy_command_list, forget_list>();
         observe<addon_event::execute_secondary_command_list, bundle>();
         observe<addon_event::execute_command_list, submit>();
         observe<addon_event::present, present>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::finish_present, finish_present>();
+#endif
         observe<addon_event::destroy_swapchain, destroy_swapchain>();
         observe<addon_event::destroy_effect_runtime, destroy_settings_runtime>();
+#ifdef ZZZ_AO_ENABLE_TRACE
         observe<addon_event::reshade_open_overlay, overlay_state_changed>();
+#endif
         reshade::register_overlay(nullptr, guarded<draw_settings>(draw_settings));
-        reshade::log::message(reshade::log::level::info, "ZZZ AO DX12 diagnostics loaded. Controls are in the ReShade Add-ons panel.");
+        reshade::log::message(reshade::log::level::info, "ZZZ DX12 AO loaded. Use the Detail AO checkbox in the ReShade Add-ons panel.");
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
         reshade::unregister_addon(module);
     }
