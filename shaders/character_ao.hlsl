@@ -81,7 +81,7 @@ float FormLighting(int2 pixel, int2 limit, float2 dimensions, float center, floa
     const float3 key = normalize(float3(-0.60, 0.66, 0.45));
     const float directional = dot(normal, key) - key.z;
     const float grazing = 1.0 - saturate(normal.z);
-    return 1.0 + 0.42 * directional - 0.09 * grazing * grazing;
+    return 1.0 + 0.42 * directional - 0.125 * grazing * grazing;
 }
 
 float OcclusionDisk(int2 pixel, int2 limit, float2 texelSize, float center, float inverseCenter, float2 slope)
