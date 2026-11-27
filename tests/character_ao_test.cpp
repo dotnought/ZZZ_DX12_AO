@@ -3,7 +3,7 @@
 #include "character_scene_ps.hpp"
 #include "character_scene_vs.hpp"
 #include "shading_view_ps.hpp"
-#include "sphere_depth_ps.hpp"
+#include "curved_depth_ps.hpp"
 
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
@@ -103,7 +103,7 @@ ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device *device, ID3D12RootSignatu
         desc.PS = {shading_view_ps_bytecode, sizeof(shading_view_ps_bytecode)};
         break;
     case TestPass::depth:
-        desc.PS = {sphere_depth_ps_bytecode, sizeof(sphere_depth_ps_bytecode)};
+        desc.PS = {curved_depth_ps_bytecode, sizeof(curved_depth_ps_bytecode)};
         break;
     }
     desc.BlendState.RenderTarget[0] = {composite, FALSE, composite ? D3D12_BLEND_ZERO : D3D12_BLEND_ONE,
@@ -152,10 +152,10 @@ int main()
         return 1;
     }
     auto native = MakePipeline(device.Get(), native_root.Get(), TestPass::game);
-    auto sphere = MakePipeline(device.Get(), native_root.Get(), TestPass::depth);
+    auto curved_depth = MakePipeline(device.Get(), native_root.Get(), TestPass::depth);
     ao.Attach(ShadingPass::composite, MakePipeline(device.Get(), ao.Root(), TestPass::composite).Detach());
     ao.Attach(ShadingPass::preview, MakePipeline(device.Get(), ao.Root(), TestPass::preview).Detach());
-    if (!native || !sphere || !ao.HasPipeline(ShadingPass::composite) || !ao.HasPipeline(ShadingPass::preview))
+    if (!native || !curved_depth || !ao.HasPipeline(ShadingPass::composite) || !ao.HasPipeline(ShadingPass::preview))
         return 1;
 
     auto depth_desc = color_desc;
@@ -257,10 +257,10 @@ int main()
     list->SetGraphicsRootSignature(native_root.Get());
     for (UINT i = 0; i < tables.size(); ++i)
         list->SetGraphicsRootDescriptorTable(i, tables[i]);
-    const D3D12_RECT sphere_scissor{0, 192, extent, extent};
-    list->RSSetScissorRects(1, &sphere_scissor);
+    const D3D12_RECT curves_scissor{0, 192, extent, extent};
+    list->RSSetScissorRects(1, &curves_scissor);
     list->OMSetRenderTargets(0, nullptr, FALSE, &dsv_handle);
-    list->SetPipelineState(sphere.Get());
+    list->SetPipelineState(curved_depth.Get());
     list->DrawInstanced(3, 1, 0, 0);
     list->RSSetScissorRects(1, &scissor);
     list->OMSetRenderTargets(1, &scene_rtv, FALSE, nullptr);
@@ -334,6 +334,17 @@ int main()
                            std::abs(game[1] - 153.0f * multiplier) < 1.6f &&
                            std::abs(game[2] - 102.0f * multiplier) < 1.6f;
     }
+    constexpr UINT cylinder_y = 220;
+    const int cylinder_start = pixel(56, cylinder_y, stride)[0];
+    int cylinder_previous = cylinder_start;
+    bool cylinder_smooth = true;
+    for (UINT x = 57; x <= 83; ++x) {
+        const int current = pixel(x, cylinder_y, stride)[0];
+        const int drop = cylinder_previous - current;
+        cylinder_smooth &= drop >= -1 && drop <= 11;
+        cylinder_previous = current;
+    }
+    cylinder_smooth &= cylinder_start - cylinder_previous >= 55;
     const bool blend_and_restore = pixel(contact_edge - 1, profile_y)[3] == 64 &&
                                    pixel(4, profile_y, 2 * stride)[0] == 64 &&
                                    pixel(4, profile_y, 2 * stride)[1] == 128 &&
@@ -342,6 +353,12 @@ int main()
         std::cerr << "Unexpected contact profile.";
         for (UINT x = contact_edge - 25; x < contact_edge; ++x)
             std::cerr << ' ' << int(pixel(x, profile_y)[0]);
+        std::cerr << '\n';
+    }
+    if (!cylinder_smooth) {
+        std::cerr << "Faceted cylinder shading was stepped or lost its contrast.";
+        for (UINT x = 56; x <= 83; ++x)
+            std::cerr << ' ' << int(pixel(x, cylinder_y, stride)[0]);
         std::cerr << '\n';
     }
     const D3D12_RANGE written{0, 0};
@@ -354,7 +371,7 @@ int main()
         std::cerr << "Grayscale preview disagreed with the shading applied to scene color.\n";
     if (!blend_and_restore)
         std::cerr << "Unexpected scene-color alpha or restored draw.\n";
-    if (!falls_off || !neutral || !form_shading || !matches_preview || !blend_and_restore)
+    if (!falls_off || !neutral || !form_shading || !cylinder_smooth || !matches_preview || !blend_and_restore)
         return 1;
     ComPtr<ID3D12InfoQueue> info;
     if (SUCCEEDED(device.As(&info))) {
@@ -372,6 +389,6 @@ int main()
             }
         }
     }
-    std::cout << "Verified sphere shading, preview parity, AO falloff, alpha and graphics state through D3D12 WARP.\n";
+    std::cout << "Verified curved-surface shading, preview parity, AO falloff, alpha and graphics state through D3D12 WARP.\n";
     return 0;
 }

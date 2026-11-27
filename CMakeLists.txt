@@ -74,7 +74,7 @@ if(ZZZ_AO_TEST_DEPTH_CAPTURE)
 
     embed_shader(tests/character_scene.hlsl vs_6_0 SceneVertex character_scene_vs scene_test_headers)
     embed_shader(tests/character_scene.hlsl ps_6_0 SceneColor character_scene_ps scene_test_headers)
-    embed_shader(tests/character_scene.hlsl ps_6_0 SphereDepth sphere_depth_ps scene_test_headers)
+    embed_shader(tests/character_scene.hlsl ps_6_0 CurvedDepth curved_depth_ps scene_test_headers)
     add_executable(zzz_ao_character_test tests/character_ao_test.cpp src/character_ao.cpp ${scene_test_headers})
     add_dependencies(zzz_ao_character_test zzz_ao_character_shader)
     target_include_directories(zzz_ao_character_test PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")

@@ -38,32 +38,48 @@ float SurfaceSlope(int2 pixel, int2 axis, int2 limit, float center)
     return abs(backward) < abs(forward) ? backward : forward;
 }
 
-float FormSlope(int2 pixel, int2 axis, int2 limit, float center, float inverseCenter, float localSlope)
+float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter, float2 localSlope)
 {
-    float sum = localSlope;
-    float totalWeight = 1.0;
+    float2 sum = 0.4 * localSlope;
+    float2 totalWeight = 0.4;
+    static const float3 scaleWeights = float3(0.6, 1.0, 0.65);
+
+    // Average centered slopes across neighboring rows and columns. A facet
+    // crossing then contributes gradually as it moves through the footprint.
     [unroll]
-    for (int radius = 5; radius <= 9; radius += 4)
+    for (int i = 0; i < 3; ++i)
     {
-        const int2 low = pixel - radius * axis;
-        const int2 high = pixel + radius * axis;
-        const float2 valid = float2(all(low >= 0), all(high <= limit));
-        const float2 delta = (float2(LoadDepth(low, limit), LoadDepth(high, limit)) - center) * inverseCenter;
-        const float2 distances = float2(-radius, radius);
-        const float2 weights = valid
-            * (1.0 - smoothstep(0.0025, 0.009, abs(delta - localSlope * distances)))
+        const int radius = 2 + 3 * i;
+        const int2 low = pixel - radius;
+        const int2 high = pixel + radius;
+        const float4 valid = float4(
+            all(low >= 0), high.x <= limit.x && low.y >= 0,
+            low.x >= 0 && high.y <= limit.y, all(high <= limit));
+        const float4 depth = float4(
+            LoadDepth(low, limit), LoadDepth(int2(high.x, low.y), limit),
+            LoadDepth(int2(low.x, high.y), limit), LoadDepth(high, limit));
+        const float4 delta = (depth - center) * inverseCenter;
+        const float4 tangent = radius * (float4(-1, 1, -1, 1) * localSlope.x
+                                       + float4(-1, -1, 1, 1) * localSlope.y);
+        const float4 confidence = valid * scaleWeights[i]
+            * (1.0 - smoothstep(0.0035, 0.012, abs(delta - tangent)))
             * (1.0 - smoothstep(0.028, 0.085, abs(delta)));
-        sum += dot(weights, delta / distances);
-        totalWeight += weights.x + weights.y;
+
+        // Both ends must belong to the receiving surface. The local slope
+        // remains available for thin geometry with no reliable wide pair.
+        const float2 horizontal = min(confidence.xz, confidence.yw);
+        const float2 vertical = min(confidence.xy, confidence.zw);
+        const float inverseSpan = 0.5 / radius;
+        sum += inverseSpan * float2(dot(horizontal, delta.yw - delta.xz),
+                                    dot(vertical, delta.zw - delta.xy));
+        totalWeight += float2(horizontal.x + horizontal.y, vertical.x + vertical.y);
     }
     return sum / totalWeight;
 }
 
 float FormLighting(int2 pixel, int2 limit, float2 dimensions, float center, float inverseCenter, float2 slope)
 {
-    const float2 derivative = float2(
-        FormSlope(pixel, int2(1, 0), limit, center, inverseCenter, slope.x),
-        FormSlope(pixel, int2(0, 1), limit, center, inverseCenter, slope.y));
+    const float2 derivative = SmoothFormSlope(pixel, limit, center, inverseCenter, slope);
 
     // Approximate the camera's ray spacing. Inverse depth is affine on a
     // perspective plane, so account for the pixel's distance from screen center.

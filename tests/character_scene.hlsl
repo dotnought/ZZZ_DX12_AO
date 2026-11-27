@@ -22,8 +22,18 @@ float4 SceneColor(Vertex input) : SV_Target0
     return float4(depth, 0.5, 0.75, 1.0);
 }
 
-float SphereDepth(Vertex input) : SV_Depth
+float CurvedDepth(Vertex input) : SV_Depth
 {
+    // Piecewise-linear depth across a cylinder reproduces a faceted limb.
+    const float acrossCylinder = (input.uv.x - 0.28) / 0.095;
+    if (abs(acrossCylinder) < 1.0)
+    {
+        const float facet = acrossCylinder / 0.24;
+        const float2 ends = (floor(facet) + float2(0.0, 1.0)) * 0.24;
+        const float2 curve = sqrt(saturate(1.0 - ends * ends));
+        return 0.235 + 0.024 * lerp(curve.x, curve.y, frac(facet));
+    }
+
     const float3 ray = normalize(float3((input.uv * 2.0 - 1.0) * 0.58, 1.0));
     const float3 center = float3(0.0, 0.87, 2.0);
     const float projection = dot(ray, center);
