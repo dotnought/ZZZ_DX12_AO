@@ -21,8 +21,7 @@ float SurfaceSlope(int2 pixel, int2 axis, int2 limit, float center)
     return abs(backward) < abs(forward) ? backward : forward;
 }
 
-float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter, float2 localSlope,
-                       out float curvature)
+float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter, float2 localSlope)
 {
     float2 correction = 0.0;
     float fullWeight = 0.32;
@@ -31,10 +30,6 @@ float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter
     float4 lastDepth = 0.0;
     float4 lastStep = float4(-1, 1, -1, 1) * localSlope.x
                     + float4(-1, -1, 1, 1) * localSlope.y;
-    float curvatureSum = 0.0;
-    float curvatureWeight = 0.0;
-    float4 depthAtTwo = 0.0;
-    float4 depthAtThree = 0.0;
 
     // Check every texel along the four diagonals. A wide sample cannot
     // contribute if a closer sample crossed an edge on the same path.
@@ -57,28 +52,6 @@ float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter
         lastDepth = delta;
         lastStep = step;
 
-        // Use second differences on the connected surface to find curvature.
-        // Two opposing samples cancel the linear slope of a flat surface.
-        if (radius >= 3)
-        {
-            const float2 paired = min(confidence.xy, confidence.wz);
-            curvatureSum -= dot(paired, delta.xy + delta.wz) / (radius * radius);
-            curvatureWeight += paired.x + paired.y;
-        }
-        if (radius == 2)
-            depthAtTwo = delta;
-        if (radius == 3)
-            depthAtThree = delta;
-        if (radius == 4 || radius == 6)
-        {
-            // A supported span on one side also works near a silhouette.
-            const float4 midpoint = radius == 4 ? depthAtTwo : depthAtThree;
-            const float halfSpan = 0.5 * radius;
-            const float4 oneSided = 0.43 * confidence;
-            curvatureSum += dot(oneSided, 2.0 * midpoint - delta) / (halfSpan * halfSpan);
-            curvatureWeight += dot(oneSided, 1.0);
-        }
-
         // Both ends must belong to the receiving surface. The local slope
         // remains available for thin geometry with no reliable wide pair.
         const float2 horizontal = min(confidence.xz, confidence.yw);
@@ -92,30 +65,23 @@ float2 SmoothFormSlope(int2 pixel, int2 limit, float center, float inverseCenter
 
     // Keep the original tangent as the prior for missing coverage. This
     // prevents one surviving diagonal from dominating next to a silhouette.
-    curvature = abs(curvatureSum) / max(curvatureWeight, 3.5);
     return localSlope + correction / fullWeight;
 }
 
 float FormLighting(int2 pixel, int2 limit, float2 dimensions, float center, float inverseCenter, float2 slope)
 {
-    float curvature;
-    const float2 derivative = SmoothFormSlope(pixel, limit, center, inverseCenter, slope, curvature);
+    const float2 derivative = SmoothFormSlope(pixel, limit, center, inverseCenter, slope);
 
     // Approximate the camera's ray spacing. Inverse depth is affine on a
     // perspective plane, so account for the pixel's distance from screen center.
     const float pixelRaySpacing = 1.16 / dimensions.y;
-    const float2 offset = pixel + 0.5 - 0.5 * dimensions;
-    const float forward = 1.0 - dot(offset, derivative);
+    const float forward = 1.0 - dot(pixel + 0.5 - 0.5 * dimensions, derivative);
     const float3 normal = normalize(float3(-derivative / pixelRaySpacing, max(forward, 0.03)));
-    const float3 toCamera = normalize(float3(-offset * pixelRaySpacing, 1.0));
-    const float facing = saturate(dot(normal, toCamera));
     // Native depth UVs are bottom-up in the observed scene.
     const float3 key = normalize(float3(-0.60, 0.66, 0.45));
     const float directional = dot(normal, key) - key.z;
-    const float form = lerp(0.63, 1.12, smoothstep(0.05, 0.94, facing)) + 0.13 * directional;
-    // The diagonal sample spacing is sqrt(2) times the per-axis ray spacing.
-    const float viewCurvature = curvature / (2.0 * pixelRaySpacing * pixelRaySpacing);
-    return lerp(1.0, form, smoothstep(0.10, 2.20, viewCurvature));
+    const float grazing = 1.0 - saturate(normal.z);
+    return 1.0 + 0.42 * directional - 0.09 * grazing * grazing;
 }
 
 float OcclusionDisk(int2 pixel, int2 limit, float2 texelSize, float center, float inverseCenter, float2 slope)

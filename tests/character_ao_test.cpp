@@ -335,23 +335,19 @@ int main()
 
     bool neutral = flat_color == 204 && pixel(contact_edge, profile_y)[0] == flat_color;
     const int tilted_color = pixel(contact_edge, 160)[0];
-    neutral &= tilted_color == flat_color;
     for (UINT x = contact_edge - 25; x <= contact_edge + 25; ++x) {
         neutral &= pixel(x, 96)[0] == flat_color;
         neutral &= std::abs(int(pixel(x, 160)[0]) - tilted_color) <= 1;
     }
     constexpr UINT sphere_y = 222;
-    const int sphere_center = pixel(128, sphere_y)[0];
-    bool form_shading = sphere_center > 214 &&
-                        sphere_center - pixel(108, sphere_y)[0] >= 20 &&
-                        sphere_center - pixel(146, sphere_y)[0] >= 20 &&
-                        sphere_center - pixel(128, 206)[0] >= 20 &&
-                        pixel(148, sphere_y)[0] <= pixel(146, sphere_y)[0];
+    bool form_shading = pixel(110, sphere_y)[0] - pixel(144, sphere_y)[0] >= 50 &&
+                        pixel(128, 239)[0] - pixel(128, 208)[0] >= 50;
+    form_shading &= pixel(128, 239)[0] > 211 && pixel(128, 208)[0] < 175;
     bool matches_preview = pixel(40, sphere_y)[0] == 204 && pixel(40, sphere_y, stride)[0] == 0;
     int previous_gray = pixel(110, sphere_y, stride)[0];
     for (UINT x = 110; x <= 144; x += 2) {
         const auto *gray = pixel(x, sphere_y, stride);
-        form_shading &= std::abs(int(gray[0]) - previous_gray) <= 20;
+        form_shading &= gray[0] <= previous_gray + 2 && previous_gray - gray[0] <= 30;
         previous_gray = gray[0];
         const float multiplier = 0.22f + 1.04f * gray[0] / 255.0f;
         const auto *game = pixel(x, sphere_y);
@@ -371,15 +367,16 @@ int main()
             even_silhouette &= std::abs(int(pixel(x, y, stride)[0]) - pixel(225, y, stride)[0]) <= 1;
     }
     constexpr UINT cylinder_y = 220;
-    const int cylinder_center = pixel(72, cylinder_y, stride)[0];
-    bool cylinder_smooth = cylinder_center - pixel(56, cylinder_y, stride)[0] >= 22 &&
-                           cylinder_center - pixel(88, cylinder_y, stride)[0] >= 22;
-    int cylinder_previous = pixel(56, cylinder_y, stride)[0];
-    for (UINT x = 57; x <= 88; ++x) {
+    const int cylinder_start = pixel(56, cylinder_y, stride)[0];
+    int cylinder_previous = cylinder_start;
+    bool cylinder_smooth = true;
+    for (UINT x = 57; x <= 83; ++x) {
         const int current = pixel(x, cylinder_y, stride)[0];
-        cylinder_smooth &= std::abs(cylinder_previous - current) <= 11;
+        const int drop = cylinder_previous - current;
+        cylinder_smooth &= drop >= -1 && drop <= 11;
         cylinder_previous = current;
     }
+    cylinder_smooth &= cylinder_start - cylinder_previous >= 55;
     const bool blend_and_restore = pixel(contact_edge - 1, profile_y)[3] == 64 &&
                                    pixel(4, profile_y, 2 * stride)[0] == 64 &&
                                    pixel(4, profile_y, 2 * stride)[1] == 128 &&
@@ -392,7 +389,7 @@ int main()
     }
     if (!cylinder_smooth) {
         std::cerr << "Faceted cylinder shading was stepped or lost its contrast.";
-        for (UINT x = 56; x <= 88; ++x)
+        for (UINT x = 56; x <= 83; ++x)
             std::cerr << ' ' << int(pixel(x, cylinder_y, stride)[0]);
         std::cerr << '\n';
     }
@@ -405,7 +402,7 @@ int main()
     if (!even_silhouette)
         std::cerr << "An occlusion wedge or depth leak appeared around a rounded silhouette.\n";
     if (!form_shading)
-        std::cerr << "The sphere did not retain a bright center and softly shaded sides.\n";
+        std::cerr << "The sphere did not have a gradual directional shading profile.\n";
     if (!matches_preview)
         std::cerr << "Grayscale preview disagreed with the shading applied to scene color.\n";
     if (!blend_and_restore)
